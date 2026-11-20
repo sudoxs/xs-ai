@@ -7,7 +7,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
  \  \/  /  ___    /   \/  _  \ ___
   >    <   \_ \  / /\  \  ___// _ \
  /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.3
+  Pentest AI Assistant  v0.4
 ```
 
 ## How It Works
@@ -94,6 +94,25 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--report-dir` | `reports/` | Report output directory |
 | `--load` | | Load a saved session |
 | `--os-type` | | Target OS (`linux` or `windows`) |
+| `--api` | `ollama` | AI backend: `ollama`, `openai`, or `anthropic` |
+| `--api-key` | | API key for cloud backends (or set `XS_API_KEY` env) |
+| `--api-url` | | Custom API base URL |
+| `--no-memory` | | Don't load/save project memory |
+
+### Cloud API (OpenAI / Anthropic)
+
+```bash
+# Use OpenAI instead of local Ollama
+python3 client.py --host ignored --api openai --api-key sk-...
+
+# Use Anthropic Claude
+python3 client.py --host ignored --api anthropic --api-key sk-ant-...
+
+# Custom endpoint (e.g. Azure OpenAI, local vLLM)
+python3 client.py --host ignored --api openai --api-key KEY --api-url http://localhost:8000/v1
+```
+
+> **Warning:** Cloud API mode sends command outputs and target info to external servers. Do not use on engagements with strict data-handling requirements. Cloud models may also refuse some offensive commands.
 
 ### Interactive Commands
 
@@ -133,6 +152,14 @@ Once inside the client, you have these commands:
 | `:ports` | Detect open ports and show available service checks |
 | `:svc <port>` | Run service-specific enum for a port (e.g. `:svc 445`) |
 | `:tools` | Show downloadable tool suggestions for current phase |
+| `:install` | Check & install missing tools on Kali |
+
+#### Session & Memory
+
+| Command | Description |
+|---------|-------------|
+| `:memory` | Save project memory (project.md) for next session |
+| `:memory show` | Display current project memory |
 
 #### Session Management
 
@@ -284,6 +311,54 @@ You can also load cheat sheets at runtime:
 [enum]> :cheat /path/to/new_notes.md
 ```
 
+## Project Memory
+
+xs-ai automatically saves a `project.md` file when you exit. This file contains an AI-readable summary of your engagement:
+
+- Target info (IP, OS, phase)
+- Open ports discovered
+- All findings
+- Credentials used
+- What commands worked / didn't work
+- Suggested next steps
+
+On next startup, xs-ai loads `project.md` automatically — the AI knows exactly where you left off.
+
+```
+# First session
+[privesc]> :quit
+[*] Project memory saved: project.md
+
+# Next day — AI picks up where you left off
+python3 client.py --host 192.168.198.1
+[OK] Project memory loaded (project.md)
+```
+
+You can also save/view manually:
+```
+[enum]> :memory              # Save now
+[enum]> :memory show         # View current state
+```
+
+Disable with `--no-memory`.
+
+## Tool Installation
+
+Run `:install` to check which tools are available on your Kali system. xs-ai checks 26 common pentest tools and offers to install missing ones:
+
+```
+[recon]> :install
+  Checking 26 tools...
+  Missing tools: whatweb, wpscan, crackmapexec
+    whatweb: apt install -y whatweb
+    wpscan: apt install -y wpscan || gem install wpscan
+    crackmapexec: apt install -y crackmapexec || pip3 install crackmapexec
+  Install missing tools? [y/n/select]: select
+    Install whatweb? [y/n]: y
+    Installing whatweb...
+    whatweb installed OK
+```
+
 ## Scope File
 
 `scope.json` restricts which targets can be used:
@@ -332,6 +407,7 @@ xs-ai/
 ├── client.py           # Main interactive client (Kali)
 ├── host_setup.ps1      # Windows host setup script
 ├── scope.json          # Allowed targets
+├── project.md          # Auto-generated project memory (AI-readable)
 ├── cheatsheets/        # Your engagement notes (.md/.txt)
 │   └── example.md
 ├── sessions/           # Saved sessions (auto-created, gitignored)
@@ -381,8 +457,9 @@ python3 client.py --host 192.168.198.1 \
 - All commands require explicit operator approval before execution
 - Scope enforcement prevents testing unauthorized targets
 - Sessions and reports are gitignored by default
-- No credentials are sent to external services — everything stays local
-- The AI runs entirely on your local Ollama instance
+- In Ollama mode: no data is sent to external services — everything stays local
+- Cloud API mode shows a security warning — data is sent to the provider
+- The AI runs on your local Ollama instance by default
 
 ## License
 
