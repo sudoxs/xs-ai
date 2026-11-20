@@ -3,11 +3,14 @@
 Local AI pentest assistant that connects Ollama models on your Windows host to an interactive client on Kali Linux. Load your cheat sheets, walk through pentest phases, and let the AI suggest commands — with human approval at every step.
 
 ```
- ___  _____        ___  _____
- \  \/  /  ___    /   \/  _  \ ___
-  >    <   \_ \  / /\  \  ___// _ \
- /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.5
+ ██╗  ██╗███████╗       █████╗ ██╗
+ ╚██╗██╔╝██╔════╝      ██╔══██╗██║
+  ╚███╔╝ ███████╗█████╗███████║██║
+  ██╔██╗ ╚════██║╚════╝██╔══██║██║
+ ██╔╝ ██╗███████║      ██║  ██║██║
+ ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
+   PENTEST AI ORCHESTRATOR  v0.5
+   by sudoxs
 ```
 
 ## How It Works
