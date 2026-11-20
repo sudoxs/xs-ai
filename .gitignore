@@ -5,4 +5,5 @@ __pycache__/
 sessions/
 reports/
 project.md
+roles.json
 *.log

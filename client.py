@@ -48,12 +48,22 @@ MAX_AI_CONTEXT = 28000
 
 PHASES = ["recon", "enum", "access", "privesc", "report"]
 
+AI_ROLES = ["planner", "analyzer", "recon", "enum", "access", "privesc", "reporter"]
+
+DEFAULT_ROLE_CHAIN: dict[str, str] = {
+    "recon": "planner",
+    "enum": "planner",
+    "access": "analyzer",
+    "privesc": "analyzer",
+    "report": "reporter",
+}
+
 BANNER = r"""
  ___  _____        ___  _____
  \  \/  /  ___    /   \/  _  \ ___
   >    <   \_ \  / /\  \  ___// _ \
  /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.4
+  Pentest AI Assistant  v0.5
 """
 
 # ---------------------------------------------------------------------------
@@ -665,6 +675,62 @@ def load_project_memory(directory: str = ".") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Role mapping — per-phase / per-task model routing
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RoleMap:
+    mapping: dict[str, str] = field(default_factory=dict)
+
+    def resolve(self, phase: str) -> str:
+        if phase in self.mapping:
+            return self.mapping[phase]
+        fallback = DEFAULT_ROLE_CHAIN.get(phase, "planner")
+        if fallback in self.mapping:
+            return self.mapping[fallback]
+        return ""
+
+    def set_role(self, role: str, model: str) -> None:
+        self.mapping[role] = model
+
+    def remove_role(self, role: str) -> bool:
+        return self.mapping.pop(role, None) is not None
+
+    def summary(self) -> str:
+        lines = []
+        for phase in PHASES:
+            model = self.resolve(phase)
+            direct = phase in self.mapping
+            tag = " (direct)" if direct else f" (via {DEFAULT_ROLE_CHAIN.get(phase, '?')})"
+            lines.append(f"  {phase:10s} -> {model or '(default)'}{tag if model else ''}")
+        for role in sorted(self.mapping):
+            if role not in PHASES:
+                lines.append(f"  {role:10s} =  {self.mapping[role]}")
+        return "\n".join(lines)
+
+
+def load_roles_file(path: str = "roles.json") -> RoleMap:
+    rm = RoleMap()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        rm.set_role(k, v)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return rm
+
+
+def save_roles_file(rm: RoleMap, path: str = "roles.json") -> None:
+    if rm.mapping:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rm.mapping, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # AI Backend — abstraction for Ollama and cloud APIs
 # ---------------------------------------------------------------------------
 
@@ -675,6 +741,7 @@ class AIBackend:
     api_key: str
     planner_model: str
     executor_model: str
+    roles: RoleMap = field(default_factory=RoleMap)
 
     def generate(self, model: str, prompt: str, system: str = "") -> str:
         if self.backend == "ollama":
@@ -685,11 +752,22 @@ class AIBackend:
             return self._anthropic_generate(model, prompt, system)
         raise ValueError(f"Unknown backend: {self.backend}")
 
+    def model_for_phase(self, phase: str) -> str:
+        role_model = self.roles.resolve(phase)
+        if role_model:
+            return role_model
+        if phase in ("recon", "enum"):
+            return self.planner_model
+        return self.executor_model
+
     def plan(self, prompt: str, system: str = "") -> str:
         return self.generate(self.planner_model, prompt, system)
 
     def analyze(self, prompt: str, system: str = "") -> str:
         return self.generate(self.executor_model, prompt, system)
+
+    def run_phase(self, phase: str, prompt: str, system: str = "") -> str:
+        return self.generate(self.model_for_phase(phase), prompt, system)
 
     def ping(self) -> list[str]:
         if self.backend == "ollama":
@@ -800,6 +878,18 @@ class OllamaClient:
     base_url: str
     planner_model: str
     executor_model: str
+    roles: RoleMap = field(default_factory=RoleMap)
+
+    def model_for_phase(self, phase: str) -> str:
+        role_model = self.roles.resolve(phase)
+        if role_model:
+            return role_model
+        if phase in ("recon", "enum"):
+            return self.planner_model
+        return self.executor_model
+
+    def run_phase(self, phase: str, prompt: str, system: str = "") -> str:
+        return self.generate(self.model_for_phase(phase), prompt, system)
 
     def _post(self, path: str, payload: dict, timeout: int = AI_TIMEOUT) -> dict:
         data = json.dumps(payload).encode()
@@ -1447,6 +1537,10 @@ def show_help():
       :tools              Show downloadable tool suggestions for current phase
       :install            Check & install missing tools on Kali
       :memory             Save/show project memory (project.md)
+      :roles              Show/set model-to-role mapping
+      :roles <role> <model>  Assign a model to a role or phase
+      :roles save         Save role mapping to roles.json
+      :roles clear        Clear all role overrides
       :scan               Quick nmap scan (top 100 ports)
       :fullscan           Full nmap scan (all ports)
       :findings           Show current findings
@@ -1805,6 +1899,33 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("dim", "  AI will load this automatically on next startup.")
             continue
 
+        if user_input.startswith(":roles"):
+            parts = user_input.split()
+            if len(parts) == 1:
+                cprint("cyan", "  Role mapping (phase -> model):")
+                print(client.roles.summary())
+                cprint("dim", f"  Default planner : {client.planner_model}")
+                cprint("dim", f"  Default analyzer: {client.executor_model}")
+            elif len(parts) == 2 and parts[1] == "save":
+                save_roles_file(client.roles)
+                cprint("green", "  Roles saved to roles.json")
+            elif len(parts) == 2 and parts[1] == "clear":
+                client.roles = RoleMap()
+                cprint("green", "  All role overrides cleared (using defaults)")
+            elif len(parts) >= 3 and parts[1] == "rm":
+                role = parts[2]
+                if client.roles.remove_role(role):
+                    cprint("green", f"  Removed role override: {role}")
+                else:
+                    cprint("red", f"  No override for: {role}")
+            elif len(parts) >= 3:
+                role, model = parts[1], " ".join(parts[2:])
+                client.roles.set_role(role, model)
+                cprint("green", f"  {role} -> {model}")
+            else:
+                cprint("dim", "  Usage: :roles [<role> <model>] [save|clear|rm <role>]")
+            continue
+
         if user_input == ":auto":
             if session.phase == "recon":
                 checks = RECON_CHECKS
@@ -1877,7 +1998,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         cprint("dim", "  Thinking...")
         system, prompt = build_ai_prompt(session, user_input)
         try:
-            raw = client.plan(prompt, system) if session.phase in ("recon", "enum") else client.analyze(prompt, system)
+            raw = client.run_phase(session.phase, prompt, system)
         except ConnectionError as exc:
             cprint("red", f"  AI error: {exc}")
             continue
@@ -2002,11 +2123,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--api-url", help="Custom API base URL")
     p.add_argument("--no-memory", action="store_true",
                    help="Don't load/save project memory (project.md)")
+    p.add_argument("--roles", default="roles.json",
+                   help="Role mapping file (default: roles.json)")
+    p.add_argument("--role", action="append", default=[], metavar="ROLE=MODEL",
+                   help="Set a role mapping (e.g. --role recon=llama3.1:8b)")
     return p
 
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    # -- Load role mapping --
+    roles = load_roles_file(args.roles)
+    for entry in args.role:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            roles.set_role(k.strip(), v.strip())
 
     # -- Build AI backend --
     api_key = args.api_key or os.environ.get("XS_API_KEY", "")
@@ -2016,6 +2148,7 @@ def main() -> int:
             backend="ollama", base_url=base_url, api_key="",
             planner_model=args.planner_model,
             executor_model=args.executor_model,
+            roles=roles,
         )
     elif args.api == "openai":
         if not api_key:
@@ -2027,6 +2160,7 @@ def main() -> int:
         client = AIBackend(
             backend="openai", base_url=base_url, api_key=api_key,
             planner_model=planner, executor_model=executor,
+            roles=roles,
         )
         print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
         print("    Do NOT use on engagements with strict data-handling requirements.")
@@ -2040,12 +2174,18 @@ def main() -> int:
         client = AIBackend(
             backend="anthropic", base_url=base_url, api_key=api_key,
             planner_model=planner, executor_model=executor,
+            roles=roles,
         )
         print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
         print("    Do NOT use on engagements with strict data-handling requirements.")
     else:
         print(f"[FAIL] Unknown API backend: {args.api}")
         return 1
+
+    if roles.mapping:
+        print(f"[OK] Role overrides loaded ({len(roles.mapping)} roles)")
+        for r, m in roles.mapping.items():
+            print(f"     {r} -> {m}")
 
     print(f"[*] Connecting to {args.api} at {client.base_url}...")
     try:

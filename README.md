@@ -7,7 +7,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
  \  \/  /  ___    /   \/  _  \ ___
   >    <   \_ \  / /\  \  ___// _ \
  /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.4
+  Pentest AI Assistant  v0.5
 ```
 
 ## How It Works
@@ -98,6 +98,47 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--api-key` | | API key for cloud backends (or set `XS_API_KEY` env) |
 | `--api-url` | | Custom API base URL |
 | `--no-memory` | | Don't load/save project memory |
+| `--roles` | `roles.json` | Role mapping config file |
+| `--role` | | Inline role mapping (e.g. `--role recon=llama3.1:8b`) |
+
+### Role Mapping (Multi-Model)
+
+Assign different models to different phases or tasks:
+
+```bash
+# Use different models per phase
+python3 client.py --host 192.168.198.1 \
+  --role recon=llama3.1:8b \
+  --role privesc=deepseek-coder:33b \
+  --role reporter=qwen2.5-coder:7b
+
+# Set a fallback for all planning phases (recon + enum)
+python3 client.py --host 192.168.198.1 \
+  --role planner=qwen2.5:14b
+```
+
+Roles can target phases directly (`recon`, `enum`, `access`, `privesc`, `report`) or abstract roles (`planner`, `analyzer`, `reporter`). Phase overrides take priority over abstract roles.
+
+At runtime, use `:roles` to view, modify, and save mappings:
+
+```
+[recon]> :roles                        # Show current mapping
+[recon]> :roles recon llama3.1:8b      # Assign model to phase
+[recon]> :roles planner qwen2.5:14b    # Set fallback for planning phases
+[recon]> :roles save                   # Persist to roles.json
+[recon]> :roles rm recon               # Remove a phase override
+[recon]> :roles clear                  # Reset all overrides
+```
+
+Role chain: `phase -> abstract role -> default planner/executor`
+
+| Phase | Fallback Role | Default Model |
+|-------|--------------|---------------|
+| recon | planner | WhiteRabbitNeo |
+| enum | planner | WhiteRabbitNeo |
+| access | analyzer | qwen2.5-coder:7b |
+| privesc | analyzer | qwen2.5-coder:7b |
+| report | reporter | qwen2.5-coder:7b |
 
 ### Cloud API (OpenAI / Anthropic)
 
@@ -159,6 +200,7 @@ Once inside the client, you have these commands:
 | Command | Description |
 |---------|-------------|
 | `:memory` | Save project memory (project.md) for next session |
+| `:roles` | Show/set model-to-role mapping for each phase |
 | `:memory show` | Display current project memory |
 
 #### Session Management
