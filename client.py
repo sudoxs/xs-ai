@@ -53,7 +53,7 @@ BANNER = r"""
  \  \/  /  ___    /   \/  _  \ ___
   >    <   \_ \  / /\  \  ___// _ \
  /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.3
+  Pentest AI Assistant  v0.4
 """
 
 # ---------------------------------------------------------------------------
@@ -446,7 +446,353 @@ def get_relevant_tools(session: Session) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Ollama client
+# Tool installation manager — check & offer to install missing tools
+# ---------------------------------------------------------------------------
+
+TOOL_INSTALL_MAP = {
+    "nmap":           "apt install -y nmap",
+    "gobuster":       "apt install -y gobuster",
+    "feroxbuster":    "apt install -y feroxbuster",
+    "nikto":          "apt install -y nikto",
+    "enum4linux":     "apt install -y enum4linux",
+    "smbclient":      "apt install -y smbclient",
+    "rpcclient":      "apt install -y rpcclient || apt install -y samba-common-bin",
+    "ldapsearch":     "apt install -y ldap-utils",
+    "snmpwalk":       "apt install -y snmp",
+    "onesixtyone":    "apt install -y onesixtyone",
+    "dig":            "apt install -y dnsutils",
+    "whatweb":        "apt install -y whatweb",
+    "wpscan":         "apt install -y wpscan || gem install wpscan",
+    "hydra":          "apt install -y hydra",
+    "hashcat":        "apt install -y hashcat",
+    "john":           "apt install -y john",
+    "searchsploit":   "apt install -y exploitdb",
+    "crackmapexec":   "apt install -y crackmapexec || pip3 install crackmapexec",
+    "redis-cli":      "apt install -y redis-tools",
+    "showmount":      "apt install -y nfs-common",
+    "curl":           "apt install -y curl",
+    "ftp":            "apt install -y ftp",
+    "smtp-user-enum": "apt install -y smtp-user-enum",
+    "git-dumper":     "pip3 install git-dumper",
+    "impacket-mssqlclient": "apt install -y impacket-scripts || pip3 install impacket",
+    "evil-winrm":     "gem install evil-winrm",
+}
+
+
+def check_tool_installed(tool_name: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["which", tool_name], capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def check_and_install_tools(tool_names: list[str]) -> dict[str, bool]:
+    status: dict[str, bool] = {}
+    missing: list[str] = []
+    for name in tool_names:
+        installed = check_tool_installed(name)
+        status[name] = installed
+        if not installed:
+            missing.append(name)
+
+    if not missing:
+        return status
+
+    cprint("yellow", f"\n  Missing tools: {', '.join(missing)}")
+    for name in missing:
+        install_cmd = TOOL_INSTALL_MAP.get(name)
+        if install_cmd:
+            cprint("dim", f"    {name}: {install_cmd}")
+
+    try:
+        ans = input(f"  {COLOR['bold']}Install missing tools? [y/n/select]:{COLOR['reset']} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return status
+
+    if ans in ("y", "yes"):
+        for name in missing:
+            install_cmd = TOOL_INSTALL_MAP.get(name)
+            if not install_cmd:
+                cprint("dim", f"    {name}: no auto-install available")
+                continue
+            cprint("dim", f"    Installing {name}...")
+            code, output = run_command(f"sudo {install_cmd}", timeout=120)
+            if code == 0:
+                cprint("green", f"    {name} installed OK")
+                status[name] = True
+            else:
+                cprint("red", f"    {name} install failed: {output[:200]}")
+    elif ans == "select":
+        for name in missing:
+            install_cmd = TOOL_INSTALL_MAP.get(name)
+            if not install_cmd:
+                continue
+            try:
+                a = input(f"    Install {name}? [y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if a in ("y", "yes"):
+                cprint("dim", f"    Installing {name}...")
+                code, output = run_command(f"sudo {install_cmd}", timeout=120)
+                if code == 0:
+                    cprint("green", f"    {name} installed OK")
+                    status[name] = True
+                else:
+                    cprint("red", f"    {name} install failed: {output[:200]}")
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Project memory — AI-readable engagement state saved across sessions
+# ---------------------------------------------------------------------------
+
+def generate_project_memory(session: Session) -> str:
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# xs-ai Project Memory",
+        f"# Auto-generated — AI reads this to resume where you left off",
+        f"# Last updated: {ts}",
+        "",
+        f"## Target",
+        f"- IP: {session.target}",
+        f"- OS: {session.target_os or 'unknown'}",
+        f"- Current phase: {session.phase}",
+        "",
+    ]
+
+    if session.credentials:
+        lines.append("## Credentials")
+        for k, v in session.credentials.items():
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+
+    # Open ports from scan results
+    open_ports: list[str] = []
+    for rec in session.commands:
+        if rec.useful and "nmap" in rec.command:
+            for line in rec.output.splitlines():
+                m = re.match(r"\s*(\d+)/(tcp|udp)\s+open\s+(\S+)", line)
+                if m:
+                    port_info = f"{m.group(1)}/{m.group(2)} {m.group(3)}"
+                    if port_info not in open_ports:
+                        open_ports.append(port_info)
+    if open_ports:
+        lines.append("## Open Ports")
+        for p in open_ports:
+            lines.append(f"- {p}")
+        lines.append("")
+
+    if session.findings:
+        lines.append("## Findings")
+        for i, f in enumerate(session.findings, 1):
+            lines.append(f"{i}. {f}")
+        lines.append("")
+
+    # Phases completed
+    tested_phases = {rec.phase for rec in session.commands}
+    lines.append("## Progress")
+    for phase in PHASES[:-1]:
+        done = phase in tested_phases
+        mark = "x" if done else " "
+        count = sum(1 for r in session.commands if r.phase == phase)
+        lines.append(f"- [{mark}] {phase} ({count} commands run)")
+    lines.append("")
+
+    # What worked / what didn't
+    useful = [r for r in session.commands if r.useful]
+    not_useful = [r for r in session.commands if not r.useful]
+    lines.append("## What Worked")
+    if useful:
+        for rec in useful:
+            prefix = "(remote) " if rec.remote else ""
+            lines.append(f"- [{rec.phase}] {prefix}`{rec.command}`")
+            if rec.note:
+                lines.append(f"  - {rec.note}")
+    else:
+        lines.append("- Nothing useful yet")
+    lines.append("")
+
+    lines.append("## What Didn't Work")
+    if not_useful:
+        for rec in not_useful[:20]:
+            lines.append(f"- `{rec.command}` (exit {rec.exit_code})")
+        if len(not_useful) > 20:
+            lines.append(f"- ... and {len(not_useful) - 20} more")
+    else:
+        lines.append("- (all commands were useful)")
+    lines.append("")
+
+    # Next steps suggestion
+    lines.append("## Suggested Next Steps")
+    if session.phase == "recon":
+        lines.append("- Run :auto for recon checks")
+        lines.append("- Then :phase enum")
+    elif session.phase == "enum":
+        lines.append("- Run :ports to detect services")
+        lines.append("- Run :svc <port> for each open port")
+        lines.append("- Then :phase access when ready")
+    elif session.phase == "access":
+        lines.append("- Try found credentials across services")
+        lines.append("- Check :tools for exploit suggestions")
+        lines.append("- Once shell obtained: :ssh user@target, :phase privesc")
+    elif session.phase == "privesc":
+        lines.append("- Run :auto for all privesc checks")
+        lines.append("- Run :tools to see downloadable exploit suggestions")
+        lines.append("- Generate final report with :report")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def save_project_memory(session: Session, directory: str = "."):
+    content = generate_project_memory(session)
+    filepath = os.path.join(directory, "project.md")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    return filepath
+
+
+def load_project_memory(directory: str = ".") -> str:
+    filepath = os.path.join(directory, "project.md")
+    if os.path.isfile(filepath):
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# AI Backend — abstraction for Ollama and cloud APIs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AIBackend:
+    backend: str  # "ollama", "openai", "anthropic"
+    base_url: str
+    api_key: str
+    planner_model: str
+    executor_model: str
+
+    def generate(self, model: str, prompt: str, system: str = "") -> str:
+        if self.backend == "ollama":
+            return self._ollama_generate(model, prompt, system)
+        elif self.backend == "openai":
+            return self._openai_generate(model, prompt, system)
+        elif self.backend == "anthropic":
+            return self._anthropic_generate(model, prompt, system)
+        raise ValueError(f"Unknown backend: {self.backend}")
+
+    def plan(self, prompt: str, system: str = "") -> str:
+        return self.generate(self.planner_model, prompt, system)
+
+    def analyze(self, prompt: str, system: str = "") -> str:
+        return self.generate(self.executor_model, prompt, system)
+
+    def ping(self) -> list[str]:
+        if self.backend == "ollama":
+            req = urllib.request.Request(f"{self.base_url}/api/tags")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            return [m["name"] for m in data.get("models", [])]
+        elif self.backend == "openai":
+            req = urllib.request.Request(
+                f"{self.base_url}/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            return [m["id"] for m in data.get("data", [])][:10]
+        elif self.backend == "anthropic":
+            return [self.planner_model, self.executor_model]
+        return []
+
+    def _ollama_generate(self, model: str, prompt: str, system: str) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.15, "num_predict": 2048},
+        }
+        if system:
+            payload["system"] = system
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/api/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+                result = json.loads(resp.read().decode())
+            return str(result.get("response", "")).strip()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:800]
+            raise ConnectionError(f"Ollama HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ConnectionError(f"Ollama unreachable: {exc}") from exc
+
+    def _openai_generate(self, model: str, prompt: str, system: str) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = {"model": model, "messages": messages, "temperature": 0.15, "max_tokens": 2048}
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+                result = json.loads(resp.read().decode())
+            return str(result["choices"][0]["message"]["content"]).strip()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:800]
+            raise ConnectionError(f"OpenAI HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ConnectionError(f"OpenAI unreachable: {exc}") from exc
+
+    def _anthropic_generate(self, model: str, prompt: str, system: str) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            payload["system"] = system
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{self.base_url}/messages",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+                result = json.loads(resp.read().decode())
+            return str(result["content"][0]["text"]).strip()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:800]
+            raise ConnectionError(f"Anthropic HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise ConnectionError(f"Anthropic unreachable: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Ollama client (legacy — wraps AIBackend for backwards compat)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1011,7 +1357,7 @@ def approve(cmd: str, remote: bool = False) -> bool | str:
 # ---------------------------------------------------------------------------
 
 def run_auto_checks(checks: list[tuple[str, str]], session: Session,
-                    client: OllamaClient | None, execute_fn) -> list[CommandRecord]:
+                    client: OllamaClient | AIBackend | None, execute_fn) -> list[CommandRecord]:
     results: list[CommandRecord] = []
     cprint("cyan", f"\n  Auto-enum: {len(checks)} checks available")
 
@@ -1099,6 +1445,8 @@ def show_help():
       :svc <port>         Run service-specific enum for a port (e.g. :svc 445)
       :ports              Detect open ports and suggest service checks
       :tools              Show downloadable tool suggestions for current phase
+      :install            Check & install missing tools on Kali
+      :memory             Save/show project memory (project.md)
       :scan               Quick nmap scan (top 100 ports)
       :fullscan           Full nmap scan (all ports)
       :findings           Show current findings
@@ -1152,7 +1500,7 @@ def show_status(session: Session):
     cprint("green", f"    Findings:    {len(session.findings)}")
 
 
-def interactive_loop(client: OllamaClient, session: Session, scope: set[str],
+def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
                      report_dir: str):
     cprint("cyan", BANNER)
     cprint("green", f"  Connected to: {client.base_url}")
@@ -1433,6 +1781,30 @@ def interactive_loop(client: OllamaClient, session: Session, scope: set[str],
             cprint("dim", "  Run the 'Check' command via :run or :rrun to verify prerequisites.")
             continue
 
+        if user_input == ":install":
+            tools_to_check = list(TOOL_INSTALL_MAP.keys())
+            cprint("cyan", f"\n  Checking {len(tools_to_check)} tools...")
+            status = check_and_install_tools(tools_to_check)
+            installed = [t for t, ok in status.items() if ok]
+            missing = [t for t, ok in status.items() if not ok]
+            cprint("green", f"  Installed ({len(installed)}): {', '.join(installed[:15])}{'...' if len(installed) > 15 else ''}")
+            if missing:
+                cprint("yellow", f"  Missing ({len(missing)}): {', '.join(missing)}")
+            else:
+                cprint("green", "  All tools installed!")
+            continue
+
+        if user_input.startswith(":memory"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 2 and parts[1] == "show":
+                mem = generate_project_memory(session)
+                print(mem)
+            else:
+                mem_path = save_project_memory(session)
+                cprint("green", f"  Project memory saved: {mem_path}")
+                cprint("dim", "  AI will load this automatically on next startup.")
+            continue
+
         if user_input == ":auto":
             if session.phase == "recon":
                 checks = RECON_CHECKS
@@ -1624,26 +1996,65 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--load", dest="load_session", help="Load a saved session file")
     p.add_argument("--os-type", dest="os_type", choices=("linux", "windows"),
                    help="Target OS type")
+    p.add_argument("--api", choices=("ollama", "openai", "anthropic"), default="ollama",
+                   help="AI backend (default: ollama)")
+    p.add_argument("--api-key", help="API key for cloud backends (or set XS_API_KEY env)")
+    p.add_argument("--api-url", help="Custom API base URL")
+    p.add_argument("--no-memory", action="store_true",
+                   help="Don't load/save project memory (project.md)")
     return p
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    base_url = f"http://{args.host}:{args.port}"
 
-    client = OllamaClient(
-        base_url=base_url,
-        planner_model=args.planner_model,
-        executor_model=args.executor_model,
-    )
+    # -- Build AI backend --
+    api_key = args.api_key or os.environ.get("XS_API_KEY", "")
+    if args.api == "ollama":
+        base_url = args.api_url or f"http://{args.host}:{args.port}"
+        client = AIBackend(
+            backend="ollama", base_url=base_url, api_key="",
+            planner_model=args.planner_model,
+            executor_model=args.executor_model,
+        )
+    elif args.api == "openai":
+        if not api_key:
+            print("[FAIL] --api-key or XS_API_KEY required for OpenAI backend")
+            return 1
+        base_url = args.api_url or "https://api.openai.com/v1"
+        planner = args.planner_model if args.planner_model != build_parser().get_default("planner_model") else "gpt-4o"
+        executor = args.executor_model if args.executor_model != "qwen2.5-coder:7b" else "gpt-4o-mini"
+        client = AIBackend(
+            backend="openai", base_url=base_url, api_key=api_key,
+            planner_model=planner, executor_model=executor,
+        )
+        print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
+        print("    Do NOT use on engagements with strict data-handling requirements.")
+    elif args.api == "anthropic":
+        if not api_key:
+            print("[FAIL] --api-key or XS_API_KEY required for Anthropic backend")
+            return 1
+        base_url = args.api_url or "https://api.anthropic.com/v1"
+        planner = args.planner_model if args.planner_model != build_parser().get_default("planner_model") else "claude-sonnet-4-20250514"
+        executor = args.executor_model if args.executor_model != "qwen2.5-coder:7b" else "claude-haiku-4-20250414"
+        client = AIBackend(
+            backend="anthropic", base_url=base_url, api_key=api_key,
+            planner_model=planner, executor_model=executor,
+        )
+        print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
+        print("    Do NOT use on engagements with strict data-handling requirements.")
+    else:
+        print(f"[FAIL] Unknown API backend: {args.api}")
+        return 1
 
-    print(f"[*] Connecting to Ollama at {base_url}...")
+    print(f"[*] Connecting to {args.api} at {client.base_url}...")
     try:
         models = client.ping()
         print(f"[OK] Models available: {', '.join(models)}")
     except Exception as exc:
-        print(f"[FAIL] Cannot reach Ollama: {exc}")
-        print(f"       Make sure host_setup.ps1 has been run on {args.host}")
+        print(f"[FAIL] Cannot reach AI backend: {exc}")
+        if args.api == "ollama":
+            print(f"       Make sure host_setup.ps1 has been run on {args.host}")
         return 1
 
     scope = load_scope(args.scope)
@@ -1657,6 +2068,13 @@ def main() -> int:
     if os.path.isdir("cheatsheets"):
         cheat_paths.append("cheatsheets")
     cheatsheet_ctx = load_cheatsheets(cheat_paths) if cheat_paths else ""
+
+    # Load project memory
+    if not args.no_memory:
+        project_mem = load_project_memory()
+        if project_mem:
+            cheatsheet_ctx = project_mem + "\n\n---\n\n" + cheatsheet_ctx if cheatsheet_ctx else project_mem
+            print(f"[OK] Project memory loaded (project.md)")
 
     # Load or create session
     if args.load_session:
@@ -1703,6 +2121,9 @@ def main() -> int:
         if session.commands:
             path = generate_report(session, args.report_dir)
             print(f"\n[*] Report saved: {path}")
+            if not args.no_memory:
+                mem_path = save_project_memory(session)
+                print(f"[*] Project memory saved: {mem_path}")
 
     return 0
 
