@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import urllib.error
 import urllib.parse
@@ -45,6 +47,16 @@ AI_TIMEOUT = 180
 CMD_TIMEOUT = 120
 MAX_OUTPUT = 8000
 MAX_AI_CONTEXT = 28000
+
+# -- Context budget (addresses small-model context pressure) ------------------
+# When feeding notes/evidence to the model, retrieve only the most relevant
+# chunks instead of dumping everything and head/tail-truncating.
+RETRIEVE_CHUNK_CHARS = 800      # size of each retrievable chunk
+RETRIEVE_CHEAT_K = 6            # cheat-sheet chunks kept per prompt
+RETRIEVE_EVIDENCE_K = 6         # evidence chunks kept per prompt
+DISTILL_MAX_LINES = 70         # lines kept when distilling a large tool output
+DISTILL_TRIGGER_LINES = 80     # distill only when output exceeds this
+PARALLEL_WORKERS = 3           # max concurrent checks in parallel auto-enum
 
 PHASES = ["recon", "enum", "access", "privesc", "report"]
 
@@ -65,7 +77,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.5
+   PENTEST AI ORCHESTRATOR  v0.6
    by sudoxs
 """
 
@@ -745,14 +757,16 @@ class AIBackend:
     planner_model: str
     executor_model: str
     roles: RoleMap = field(default_factory=RoleMap)
+    structured: bool = True  # prefer schema-constrained JSON responses
 
-    def generate(self, model: str, prompt: str, system: str = "") -> str:
+    def generate(self, model: str, prompt: str, system: str = "",
+                 want_json: bool = False) -> str:
         if self.backend == "ollama":
-            return self._ollama_generate(model, prompt, system)
+            return self._ollama_generate(model, prompt, system, want_json)
         elif self.backend == "openai":
-            return self._openai_generate(model, prompt, system)
+            return self._openai_generate(model, prompt, system, want_json)
         elif self.backend == "anthropic":
-            return self._anthropic_generate(model, prompt, system)
+            return self._anthropic_generate(model, prompt, system, want_json)
         raise ValueError(f"Unknown backend: {self.backend}")
 
     def model_for_phase(self, phase: str) -> str:
@@ -763,14 +777,15 @@ class AIBackend:
             return self.planner_model
         return self.executor_model
 
-    def plan(self, prompt: str, system: str = "") -> str:
-        return self.generate(self.planner_model, prompt, system)
+    def plan(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.generate(self.planner_model, prompt, system, want_json)
 
-    def analyze(self, prompt: str, system: str = "") -> str:
-        return self.generate(self.executor_model, prompt, system)
+    def analyze(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.generate(self.executor_model, prompt, system, want_json)
 
-    def run_phase(self, phase: str, prompt: str, system: str = "") -> str:
-        return self.generate(self.model_for_phase(phase), prompt, system)
+    def run_phase(self, phase: str, prompt: str, system: str = "",
+                  want_json: bool = False) -> str:
+        return self.generate(self.model_for_phase(phase), prompt, system, want_json)
 
     def ping(self) -> list[str]:
         if self.backend == "ollama":
@@ -790,7 +805,8 @@ class AIBackend:
             return [self.planner_model, self.executor_model]
         return []
 
-    def _ollama_generate(self, model: str, prompt: str, system: str) -> str:
+    def _ollama_generate(self, model: str, prompt: str, system: str,
+                         want_json: bool = False) -> str:
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -799,6 +815,8 @@ class AIBackend:
         }
         if system:
             payload["system"] = system
+        if want_json:
+            payload["format"] = "json"  # Ollama constrains output to valid JSON
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             f"{self.base_url}/api/generate",
@@ -816,12 +834,18 @@ class AIBackend:
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ConnectionError(f"Ollama unreachable: {exc}") from exc
 
-    def _openai_generate(self, model: str, prompt: str, system: str) -> str:
+    def _openai_generate(self, model: str, prompt: str, system: str,
+                         want_json: bool = False) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        payload = {"model": model, "messages": messages, "temperature": 0.15, "max_tokens": 2048}
+        payload: dict[str, Any] = {
+            "model": model, "messages": messages,
+            "temperature": 0.15, "max_tokens": 2048,
+        }
+        if want_json:
+            payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -842,14 +866,19 @@ class AIBackend:
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ConnectionError(f"OpenAI unreachable: {exc}") from exc
 
-    def _anthropic_generate(self, model: str, prompt: str, system: str) -> str:
+    def _anthropic_generate(self, model: str, prompt: str, system: str,
+                            want_json: bool = False) -> str:
         payload: dict[str, Any] = {
             "model": model,
             "max_tokens": 2048,
             "messages": [{"role": "user", "content": prompt}],
         }
         if system:
+            # Anthropic has no JSON mode flag; the contract in the system prompt
+            # plus a response prefill keeps output to a single JSON object.
             payload["system"] = system
+        if want_json:
+            payload["messages"].append({"role": "assistant", "content": "{"})
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             f"{self.base_url}/messages",
@@ -864,7 +893,10 @@ class AIBackend:
         try:
             with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
                 result = json.loads(resp.read().decode())
-            return str(result["content"][0]["text"]).strip()
+            text = str(result["content"][0]["text"]).strip()
+            if want_json and not text.startswith("{"):
+                text = "{" + text  # restore the prefilled opening brace
+            return text
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:800]
             raise ConnectionError(f"Anthropic HTTP {exc.code}: {detail}") from exc
@@ -882,6 +914,7 @@ class OllamaClient:
     planner_model: str
     executor_model: str
     roles: RoleMap = field(default_factory=RoleMap)
+    structured: bool = True
 
     def model_for_phase(self, phase: str) -> str:
         role_model = self.roles.resolve(phase)
@@ -891,8 +924,9 @@ class OllamaClient:
             return self.planner_model
         return self.executor_model
 
-    def run_phase(self, phase: str, prompt: str, system: str = "") -> str:
-        return self.generate(self.model_for_phase(phase), prompt, system)
+    def run_phase(self, phase: str, prompt: str, system: str = "",
+                  want_json: bool = False) -> str:
+        return self.generate(self.model_for_phase(phase), prompt, system, want_json)
 
     def _post(self, path: str, payload: dict, timeout: int = AI_TIMEOUT) -> dict:
         data = json.dumps(payload).encode()
@@ -911,7 +945,8 @@ class OllamaClient:
         except (urllib.error.URLError, TimeoutError) as exc:
             raise ConnectionError(f"Ollama unreachable: {exc}") from exc
 
-    def generate(self, model: str, prompt: str, system: str = "") -> str:
+    def generate(self, model: str, prompt: str, system: str = "",
+                 want_json: bool = False) -> str:
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -920,14 +955,16 @@ class OllamaClient:
         }
         if system:
             payload["system"] = system
+        if want_json:
+            payload["format"] = "json"
         result = self._post("/api/generate", payload)
         return str(result.get("response", "")).strip()
 
-    def plan(self, prompt: str, system: str = "") -> str:
-        return self.generate(self.planner_model, prompt, system)
+    def plan(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.generate(self.planner_model, prompt, system, want_json)
 
-    def analyze(self, prompt: str, system: str = "") -> str:
-        return self.generate(self.executor_model, prompt, system)
+    def analyze(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.generate(self.executor_model, prompt, system, want_json)
 
     def ping(self) -> list[str]:
         req = urllib.request.Request(f"{self.base_url}/api/tags")
@@ -967,8 +1004,11 @@ def load_cheatsheets(paths: list[str]) -> str:
         else:
             print(f"[!] Cheatsheet not found: {p}")
     combined = "\n\n---\n\n".join(parts)
-    if len(combined) > MAX_AI_CONTEXT:
-        combined = combined[:MAX_AI_CONTEXT] + "\n...[truncated]..."
+    # Keep a generous corpus — per-prompt relevance retrieval (retrieve_relevant)
+    # picks the useful chunks, so we no longer pre-truncate to the model budget.
+    corpus_cap = MAX_AI_CONTEXT * 6
+    if len(combined) > corpus_cap:
+        combined = combined[:corpus_cap] + "\n...[truncated]..."
     return combined
 
 
@@ -976,6 +1016,206 @@ def _read_file(path: str) -> str:
     with open(path, encoding="utf-8", errors="replace") as f:
         content = f.read()
     return f"# File: {os.path.basename(path)}\n{content}"
+
+
+# ---------------------------------------------------------------------------
+# Context retrieval — keyword RAG over notes/evidence (pure stdlib)
+#
+# Small local models (7B/8B) have a limited context window. Instead of dumping
+# every cheat sheet and every command output and head/tail-truncating, we chunk
+# the corpus and keep only the chunks most relevant to the current query. This
+# is a lightweight TF-IDF-style scorer — no embeddings, no dependencies.
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*")
+_STOPWORDS = frozenset(
+    "the a an and or of to in on for with is are be this that it we you i "
+    "what how why when do does can should run try use get see check".split()
+)
+
+
+def _tokenize(text: str) -> list[str]:
+    return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS and len(t) > 1]
+
+
+def _chunk_text(text: str, max_chars: int = RETRIEVE_CHUNK_CHARS) -> list[str]:
+    """Split text into ~max_chars chunks, preferring paragraph/heading breaks."""
+    if not text.strip():
+        return []
+    blocks = re.split(r"\n\s*\n|\n(?=#{1,6}\s)|\n---+\n", text)
+    chunks: list[str] = []
+    cur = ""
+    for block in blocks:
+        block = block.strip("\n")
+        if not block:
+            continue
+        if len(block) > max_chars:
+            # hard-split oversized blocks on line boundaries
+            for line in block.splitlines():
+                if len(cur) + len(line) + 1 > max_chars and cur:
+                    chunks.append(cur)
+                    cur = ""
+                cur += line + "\n"
+            continue
+        if len(cur) + len(block) + 2 > max_chars and cur:
+            chunks.append(cur)
+            cur = ""
+        cur += block + "\n\n"
+    if cur.strip():
+        chunks.append(cur)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def retrieve_relevant(query: str, corpus: str, k: int,
+                      max_chars: int = RETRIEVE_CHUNK_CHARS) -> str:
+    """Return the k chunks of `corpus` most relevant to `query`, in original order."""
+    chunks = _chunk_text(corpus, max_chars)
+    if len(chunks) <= k:
+        return corpus if len("".join(chunks)) <= k * max_chars else "\n\n".join(chunks)
+
+    q_terms = set(_tokenize(query))
+    if not q_terms:
+        # no usable query — fall back to the most recent chunks
+        return "\n\n".join(chunks[-k:])
+
+    # document frequency for IDF weighting
+    tokenized = [_tokenize(c) for c in chunks]
+    df: dict[str, int] = {}
+    for toks in tokenized:
+        for t in set(toks):
+            df[t] = df.get(t, 0) + 1
+    n = len(chunks)
+
+    import math
+    scored: list[tuple[float, int]] = []
+    for idx, toks in enumerate(tokenized):
+        if not toks:
+            scored.append((0.0, idx))
+            continue
+        tf: dict[str, int] = {}
+        for t in toks:
+            tf[t] = tf.get(t, 0) + 1
+        score = 0.0
+        for t in q_terms:
+            if t in tf:
+                idf = math.log(1 + n / (1 + df.get(t, 0)))
+                score += (tf[t] / len(toks)) * idf
+        scored.append((score, idx))
+
+    scored.sort(key=lambda s: s[0], reverse=True)
+    keep = sorted(idx for score, idx in scored[:k] if score > 0)
+    if not keep:
+        return "\n\n".join(chunks[-k:])
+    return "\n\n".join(chunks[i] for i in keep)
+
+
+# ---------------------------------------------------------------------------
+# Output distillation — shrink large tool output before it hits the model
+#
+# nmap / enum4linux / gobuster / linpeas produce hundreds of lines. Feeding
+# them whole blows the context window and buries the signal. We keep the
+# interesting lines (open ports, vulns, creds, errors) plus head/tail context.
+# The FULL output is always kept in the CommandRecord for the report — only the
+# copy sent to the model is distilled.
+# ---------------------------------------------------------------------------
+
+_INTEREST_RE = re.compile(
+    r"(?i)("
+    r"\bopen\b|/tcp|/udp|VULNERABLE|CVE-\d|\bexploit\b|"
+    r"password|passwd|\bcreds?\b|credential|\blogin\b|\buser(name)?s?\b|"
+    r"\badmin\b|\broot\b|\bhash\b|NTLM|secret|token|api[_-]?key|"
+    r"\bshare\b|writable|readable|SUID|SGID|sudo|NOPASSWD|capabilit|"
+    r"\ballowed\b|anonymous|\bbind\b|\bversion\b|\bbanner\b|"
+    r"denied|refused|failed|error|not permitted|unauthor|"
+    # extra pentest signal that often hides in otherwise-ordinary lines
+    r"\bflag\b|\bkey\b|private|-----BEGIN|\bconfig\b|database|\bdb_|"
+    r"\bbackup\b|\bdefault\b|\bguest\b|enabled|disabled|permission|"
+    r"directory|disallow|Set-Cookie|Server:|X-Powered-By|Location:|"
+    r"\btitle\b|\bhref\b|upload|/home/|/root/|[A-Za-z]:\\\\|"
+    r"\.php|\.asp|\.jsp|\.conf|\.bak|\b(200|301|302|401|403|500)\b"
+    r")"
+)
+
+
+def distill_output(cmd: str, output: str,
+                   max_lines: int = DISTILL_MAX_LINES) -> str:
+    """Return a signal-dense version of `output` for model consumption.
+
+    This only shrinks the COPY sent to the model. The full, untouched output is
+    always kept in the CommandRecord and written verbatim to the report, so no
+    clue is ever lost — distillation is never the only record of an output.
+    """
+    lines = output.splitlines()
+    if len(lines) <= DISTILL_TRIGGER_LINES:
+        return output
+
+    low = cmd.lower()
+    hits: set[int] = set()
+    is_nmap = "nmap" in low
+
+    if is_nmap:
+        for i, ln in enumerate(lines):
+            is_port = re.match(r"\s*\d+/(tcp|udp)\s", ln)
+            if is_port and " open" not in ln:
+                continue  # drop filtered/closed port noise
+            if is_port or "VULNERABLE" in ln or ln.strip().startswith("|") \
+                    or "Nmap scan report" in ln or "Service Info" in ln \
+                    or "OS details" in ln:
+                hits.add(i)
+    else:
+        for i, ln in enumerate(lines):
+            if _INTEREST_RE.search(ln):
+                hits.add(i)
+
+    n = len(lines)
+    # For generic output a clue often sits one line above/below a matched line
+    # (banners, key/value pairs, multi-line records) — keep that context. nmap
+    # port lines are self-contained, so expanding there only re-admits noise.
+    ctx: set[int] = set()
+    for i in hits:
+        if is_nmap:
+            ctx.add(i)
+        else:
+            ctx.update((i - 1, i, i + 1))
+    ctx = {i for i in ctx if 0 <= i < n}
+
+    if is_nmap:
+        # nmap's own hit set (scan report, open ports, scripts, vulns) is the
+        # signal; blind head/tail windows would only re-admit filtered noise.
+        head = set(range(min(2, n)))
+        tail = set()
+    else:
+        head = set(range(min(4, n)))
+        tail = set(range(max(0, n - 4), n))
+        # If very little matched on a large output, DON'T trust the filter to
+        # have caught everything — fall back to a generous head+tail window.
+        if len(hits) < 3:
+            head |= set(range(min(30, n)))
+            tail |= set(range(max(0, n - 15), n))
+
+    # priority when capping: context around real hits first, then head, then tail
+    keep: set[int] = set()
+    for group in (ctx, head, tail):
+        for i in sorted(group):
+            if len(keep) >= max_lines:
+                break
+            keep.add(i)
+        if len(keep) >= max_lines:
+            break
+
+    ordered = sorted(keep)
+    out_lines: list[str] = []
+    prev: int | None = None
+    for i in ordered:
+        if prev is not None and i != prev + 1:
+            out_lines.append("   ...")  # mark the gap so the model sees a cut
+        out_lines.append(lines[i])
+        prev = i
+
+    omitted = n - len(ordered)
+    note = (f"\n...[{omitted} line(s) omitted by distiller; "
+            f"full output preserved in the report/session]...") if omitted > 0 else ""
+    return "\n".join(out_lines) + note
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1248,7 @@ class SSHConnection:
     _connected: bool = False
 
     def connect(self) -> tuple[bool, str]:
+        self._clear_stale_socket()
         test_cmd = self._build_ssh_cmd("id 2>/dev/null || whoami")
         try:
             result = subprocess.run(
@@ -1035,17 +1276,72 @@ class SSHConnection:
             out = out[:MAX_OUTPUT] + "\n...[truncated]..."
         return result.returncode, out.strip()
 
+    def _control_path(self) -> str:
+        # One multiplexed master connection per host/user/port: later commands
+        # reuse it instead of re-authenticating, which is faster and keeps the
+        # session warm for rapid remote enumeration.
+        tag = hashlib.md5(f"{self.username}@{self.host}:{self.port}".encode()).hexdigest()[:12]
+        return os.path.join(tempfile.gettempdir(), f"xsai-ssh-{tag}.sock")
+
     def _build_ssh_cmd(self, cmd: str) -> list[str]:
         args = [
             "ssh", "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
             "-o", "BatchMode=yes" if self.key_file else "BatchMode=no",
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={self._control_path()}",
+            "-o", "ControlPersist=120s",
             "-p", str(self.port),
         ]
         if self.key_file:
             args += ["-i", self.key_file]
         args += [f"{self.username}@{self.host}", cmd]
         return args
+
+    def _clear_stale_socket(self) -> None:
+        """Remove a leftover control socket that has no live master behind it.
+
+        A session that died on a network drop or timeout can leave the socket
+        file on disk; without this, the next connect would print 'ControlSocket
+        already exists, disabling multiplexing' and silently lose connection
+        reuse. We probe with '-O check' and unlink only if the master is dead."""
+        cp = self._control_path()
+        if not os.path.exists(cp):
+            return
+        alive = False
+        try:
+            r = subprocess.run(
+                ["ssh", "-o", f"ControlPath={cp}", "-O", "check",
+                 f"{self.username}@{self.host}"],
+                capture_output=True, timeout=6,
+            )
+            alive = r.returncode == 0
+        except Exception:
+            alive = False
+        if not alive:
+            try:
+                os.unlink(cp)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        """Tear down the persistent master connection and remove its socket."""
+        cp = self._control_path()
+        try:
+            subprocess.run(
+                ["ssh", "-o", f"ControlPath={cp}", "-O", "exit",
+                 f"{self.username}@{self.host}"],
+                capture_output=True, timeout=8,
+            )
+        except Exception:
+            pass
+        # make sure no stale socket is left behind to block the next connect
+        try:
+            if os.path.exists(cp):
+                os.unlink(cp)
+        except OSError:
+            pass
+        self._connected = False
 
     @property
     def label(self) -> str:
@@ -1079,12 +1375,13 @@ class Session:
     ssh: SSHConnection | None = None
     target_os: str = ""  # linux, windows, or empty
 
-    def evidence_summary(self) -> str:
+    def evidence_summary(self, distill: bool = False) -> str:
         parts: list[str] = []
         for rec in self.commands:
             if rec.useful:
                 prefix = "[REMOTE] " if rec.remote else ""
-                parts.append(f"[{rec.phase}] {prefix}$ {rec.command}\n{rec.output}")
+                body = distill_output(rec.command, rec.output) if distill else rec.output
+                parts.append(f"[{rec.phase}] {prefix}$ {rec.command}\n{body}")
         return "\n\n".join(parts) if parts else "(no useful results yet)"
 
     def all_commands_summary(self) -> str:
@@ -1272,7 +1569,24 @@ TOOL: <name> and explain download + usage. Do NOT suggest CMD: for download comm
 }
 
 
-def build_ai_prompt(session: Session, user_message: str) -> tuple[str, str]:
+JSON_CONTRACT = """\
+RESPONSE FORMAT — reply with a SINGLE JSON object and nothing else (no prose, no
+markdown fences, no text before or after). Use exactly these keys:
+{
+  "message": "<your short analysis / explanation of the next step>",
+  "command": "<ONE shell command to run next, or null if none>",
+  "findings": ["<one-line finding>", ...],
+  "needs": ["<info or credential you need>", ...],
+  "access": "<initial-access one-liner, or null>",
+  "tools": ["<download-only tool name — what it does>", ...],
+  "done": false,
+  "done_summary": "<summary if done, else empty>"
+}
+Put at most one command in "command". Use null/[]/"" for anything not applicable."""
+
+
+def build_ai_prompt(session: Session, user_message: str,
+                    structured: bool = False) -> tuple[str, str]:
     system_parts = [SYSTEM_BASE, PHASE_PROMPTS.get(session.phase, "")]
 
     if session.ssh:
@@ -1280,20 +1594,33 @@ def build_ai_prompt(session: Session, user_message: str) -> tuple[str, str]:
     if session.target_os:
         system_parts.append(f"Target OS: {session.target_os}")
     if session.cheatsheet_context:
+        # Retrieve only the notes relevant to what the operator just asked,
+        # instead of dumping the whole corpus and truncating.
+        relevant_notes = retrieve_relevant(
+            f"{session.phase} {user_message}",
+            session.cheatsheet_context,
+            k=RETRIEVE_CHEAT_K,
+        )
         system_parts.append(
-            f"Operator's cheat sheet / engagement notes:\n"
-            f"---\n{session.cheatsheet_context[:MAX_AI_CONTEXT // 2]}\n---"
+            f"Relevant operator notes (retrieved):\n---\n{relevant_notes}\n---"
         )
     if session.credentials:
         cred_info = ", ".join(f"{k}: {v}" for k, v in session.credentials.items())
         system_parts.append(f"Available credentials: {cred_info}")
 
+    if structured:
+        system_parts.append(JSON_CONTRACT)
+
     system = "\n\n".join(system_parts)
 
     prompt_parts = [f"Target: {session.target}"]
-    evidence = session.evidence_summary()
+    evidence = session.evidence_summary(distill=True)
     if evidence != "(no useful results yet)":
-        prompt_parts.append(f"Evidence so far:\n{evidence[-MAX_AI_CONTEXT // 2:]}")
+        # Keep the evidence chunks most relevant to the current request.
+        relevant_evidence = retrieve_relevant(
+            f"{session.phase} {user_message}", evidence, k=RETRIEVE_EVIDENCE_K,
+        )
+        prompt_parts.append(f"Evidence so far (most relevant):\n{relevant_evidence}")
     prompt_parts.append(f"Operator: {user_message}")
 
     return system, "\n\n".join(prompt_parts)
@@ -1315,7 +1642,94 @@ class AIResponse:
     done_summary: str = ""
 
 
+_JSON_KEYS = ("message", "command", "findings", "needs", "access",
+              "tools", "done", "done_summary")
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Pull our response object out of a model reply, tolerating fences, prose
+    before/after, stray braces in the prose, and unescaped control characters.
+
+    Scans every '{' as a candidate start; returns the first balanced object that
+    parses AND carries one of our keys. Falls back to the first valid object."""
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+
+    n = len(s)
+    best: dict | None = None
+    i = 0
+    while i < n:
+        if s[i] != "{":
+            i += 1
+            continue
+        # walk from this '{' to its matching '}'
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(i, n):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end == -1:
+            break  # unbalanced from here on
+        try:
+            # strict=False tolerates literal newlines/tabs inside string values
+            obj = json.loads(s[i:end], strict=False)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            if any(k in obj for k in _JSON_KEYS):
+                return obj
+            if best is None:
+                best = obj
+        i = end
+    return best
+
+
+def _parse_json_response(obj: dict, text: str) -> AIResponse:
+    def as_list(v) -> list[str]:
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        if isinstance(v, str) and v.strip():
+            return [v.strip()]
+        return []
+
+    msg = str(obj.get("message", "")).strip()
+    resp = AIResponse(text=msg or text)
+    cmd = obj.get("command")
+    if isinstance(cmd, str) and cmd.strip() and cmd.strip().lower() not in ("null", "none"):
+        resp.command = cmd.strip()
+    resp.findings = as_list(obj.get("findings"))
+    resp.needs = as_list(obj.get("needs"))
+    access = obj.get("access")
+    if isinstance(access, str) and access.strip() and access.strip().lower() not in ("null", "none"):
+        resp.access_line = access.strip()
+    resp.tool_suggestions = as_list(obj.get("tools"))
+    resp.done = bool(obj.get("done"))
+    resp.done_summary = str(obj.get("done_summary", "")).strip()
+    return resp
+
+
 def parse_ai_response(text: str) -> AIResponse:
+    # Prefer a structured JSON reply; fall back to the legacy line protocol.
+    obj = _extract_json_object(text)
+    if obj is not None and any(key in obj for key in _JSON_KEYS):
+        return _parse_json_response(obj, text)
+
     resp = AIResponse(text=text)
     for line in text.splitlines():
         stripped = line.strip()
@@ -1376,7 +1790,7 @@ def generate_report(session: Session, output_dir: str) -> str:
         if rec.note:
             lines.append(f"**Note:** {rec.note}")
         lines.append(f"```")
-        lines.append(rec.output[:4000])
+        lines.append(rec.output[:MAX_OUTPUT])  # full captured output, never the distilled copy
         lines.append(f"```")
         lines.append("")
 
@@ -1449,44 +1863,127 @@ def approve(cmd: str, remote: bool = False) -> bool | str:
 # Auto-enum: run a checklist with per-command approval
 # ---------------------------------------------------------------------------
 
-def run_auto_checks(checks: list[tuple[str, str]], session: Session,
-                    client: OllamaClient | AIBackend | None, execute_fn) -> list[CommandRecord]:
-    results: list[CommandRecord] = []
-    cprint("cyan", f"\n  Auto-enum: {len(checks)} checks available")
+def generate_dynamic_checks(client, session: Session, port: str,
+                            banner: str) -> list[tuple[str, str]]:
+    """Ask the model for tailored enum commands for a service with no built-in
+    checklist (unusual service or non-standard port). Returns (title, cmd) pairs
+    with {target} placeholders, ready for run_auto_checks and operator approval."""
+    prompt = (
+        f"Target {session.target} has TCP port {port} open.\n"
+        f"Service/version detection:\n{banner}\n\n"
+        f"List 3 to 6 SPECIFIC, read-only, non-destructive enumeration commands "
+        f"for THIS exact service. Output ONLY commands, one per line, each line "
+        f"starting with 'CMD: '. Use the literal IP {session.target}. "
+        f"No prose, no explanations, no numbering."
+    )
+    try:
+        # Force the text protocol here regardless of structured mode — we want
+        # several commands, not one JSON object.
+        raw = client.run_phase(session.phase, prompt, SYSTEM_BASE, want_json=False)
+    except ConnectionError as exc:
+        cprint("red", f"  AI error: {exc}")
+        return []
 
-    for i, (title, cmd_template) in enumerate(checks, 1):
-        cmd = cmd_template.format(target=session.target)
-        cprint("cyan", f"\n  [{i}/{len(checks)}] {title}")
-        approval = approve(cmd, remote=bool(session.ssh))
-        if approval is False:
-            cprint("dim", "  Skipped.")
-            continue
-
-        cmd_to_run = approval if isinstance(approval, str) else cmd
-        cprint("dim", f"  Running: {cmd_to_run}")
-        code, output = execute_fn(cmd_to_run)
-        is_useful = code == 0 and len(output.strip()) > 10
-        rec = CommandRecord(
-            phase=session.phase, command=cmd_to_run,
-            exit_code=code, output=output, useful=is_useful,
-            note=title, remote=bool(session.ssh),
-        )
-        session.commands.append(rec)
-        results.append(rec)
-
-        if is_useful:
-            cprint("green", f"  Got results ({len(output)} chars)")
-            if len(output) > 500:
-                print(output[:500] + "\n  ...[truncated in display]...")
-            else:
-                print(output)
+    checks: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("CMD:"):
+            cmd = s[4:].strip()
+        elif s.startswith("$ "):
+            cmd = s[2:].strip()
         else:
-            cprint("dim", f"  No useful output (exit {code})")
+            continue
+        if not cmd or cmd in seen:
+            continue
+        seen.add(cmd)
+        cmd = cmd.replace(session.target, "{target}")
+        checks.append((f"AI check {len(checks) + 1} (port {port})", cmd))
+    return checks
+
+
+def _run_checks_parallel(checks: list[tuple[str, str]], session: Session,
+                         execute_fn) -> list[CommandRecord]:
+    """Run independent checks concurrently after a single batch approval."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cmds = [(title, tmpl.format(target=session.target)) for title, tmpl in checks]
+    cprint("yellow", f"\n  Parallel auto-enum — {len(cmds)} independent checks:")
+    for i, (title, cmd) in enumerate(cmds, 1):
+        cprint("dim", f"    [{i}] {title}: {cmd}")
+    where = " ON THE TARGET (remote)" if session.ssh else ""
+    try:
+        ans = input(f"  {COLOR['bold']}Run all {len(cmds)} concurrently{where}? [y/n]:{COLOR['reset']} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return []
+    if ans not in ("y", "yes"):
+        cprint("dim", "  Cancelled.")
+        return []
+
+    remote = bool(session.ssh)
+    cprint("dim", f"  Dispatching {len(cmds)} checks ({PARALLEL_WORKERS} at a time)...")
+
+    def _one(item: tuple[str, str]) -> CommandRecord:
+        title, cmd = item
+        code, output = execute_fn(cmd)
+        return CommandRecord(
+            phase=session.phase, command=cmd, exit_code=code, output=output,
+            useful=(code == 0 and len(output.strip()) > 10), note=title, remote=remote,
+        )
+
+    results: list[CommandRecord] = []
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        for rec in pool.map(_one, cmds):
+            results.append(rec)
+            session.commands.append(rec)
+            mark = "green" if rec.useful else "dim"
+            status = f"{len(rec.output)} chars" if rec.useful else f"no output (exit {rec.exit_code})"
+            cprint(mark, f"    [done] {rec.note}: {status}")
+    return results
+
+
+def run_auto_checks(checks: list[tuple[str, str]], session: Session,
+                    client: OllamaClient | AIBackend | None, execute_fn,
+                    parallel: bool = False) -> list[CommandRecord]:
+    if parallel:
+        results = _run_checks_parallel(checks, session, execute_fn)
+    else:
+        results = []
+        cprint("cyan", f"\n  Auto-enum: {len(checks)} checks available")
+
+        for i, (title, cmd_template) in enumerate(checks, 1):
+            cmd = cmd_template.format(target=session.target)
+            cprint("cyan", f"\n  [{i}/{len(checks)}] {title}")
+            approval = approve(cmd, remote=bool(session.ssh))
+            if approval is False:
+                cprint("dim", "  Skipped.")
+                continue
+
+            cmd_to_run = approval if isinstance(approval, str) else cmd
+            cprint("dim", f"  Running: {cmd_to_run}")
+            code, output = execute_fn(cmd_to_run)
+            is_useful = code == 0 and len(output.strip()) > 10
+            rec = CommandRecord(
+                phase=session.phase, command=cmd_to_run,
+                exit_code=code, output=output, useful=is_useful,
+                note=title, remote=bool(session.ssh),
+            )
+            session.commands.append(rec)
+            results.append(rec)
+
+            if is_useful:
+                cprint("green", f"  Got results ({len(output)} chars)")
+                if len(output) > 500:
+                    print(output[:500] + "\n  ...[truncated in display]...")
+                else:
+                    print(output)
+            else:
+                cprint("dim", f"  No useful output (exit {code})")
 
     # AI summary of auto results
     if client and results:
         useful_outputs = [
-            f"[{r.note}] $ {r.command}\n{r.output[:2000]}"
+            f"[{r.note}] $ {r.command}\n{distill_output(r.command, r.output)}"
             for r in results if r.useful
         ]
         if useful_outputs:
@@ -1535,8 +2032,9 @@ def show_help():
       :run <cmd>          Run a local command directly
       :rrun <cmd>         Run a command on remote target (SSH)
       :auto               Run auto-enum checks for current phase
-      :svc <port>         Run service-specific enum for a port (e.g. :svc 445)
+      :svc <port>         Service enum for a port; unknown ports → AI dynamic checks
       :ports              Detect open ports and suggest service checks
+      (--parallel starts auto-enum in batch-approve concurrent mode)
       :tools              Show downloadable tool suggestions for current phase
       :install            Check & install missing tools on Kali
       :memory             Save/show project memory (project.md)
@@ -1598,7 +2096,7 @@ def show_status(session: Session):
 
 
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
-                     report_dir: str):
+                     report_dir: str, parallel: bool = False):
     cprint("cyan", BANNER)
     cprint("green", f"  Connected to: {client.base_url}")
     cprint("green", f"  Target: {session.target}")
@@ -1738,6 +2236,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             continue
 
         if user_input == ":disconnect":
+            if session.ssh:
+                session.ssh.close()
             session.ssh = None
             cprint("green", "  SSH disconnected.")
             continue
@@ -1813,16 +2313,38 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             parts = user_input.split(maxsplit=1)
             if len(parts) != 2:
                 cprint("red", "  Usage: :svc <port>  (e.g. :svc 445)")
-                cprint("dim", f"  Available ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
+                cprint("dim", f"  Built-in ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
+                cprint("dim", "  Any other port -> AI generates dynamic checks from the banner.")
                 continue
             port = parts[1].strip()
-            if port not in SERVICE_PORT_MAP:
-                cprint("red", f"  No service checks for port {port}")
-                cprint("dim", f"  Available: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
-                continue
-            checks = SERVICE_PORT_MAP[port]
-            cprint("cyan", f"  Service enum for port {port}:")
-            run_auto_checks(checks, session, client, execute_cmd)
+            if port in SERVICE_PORT_MAP:
+                checks = SERVICE_PORT_MAP[port]
+                cprint("cyan", f"  Service enum for port {port}:")
+                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
+            else:
+                cprint("yellow", f"  No built-in checklist for port {port} — asking AI for dynamic checks.")
+                bcmd = f"nmap -Pn -sV -p{port} {session.target}"
+                approval = approve(bcmd)
+                if approval is False:
+                    continue
+                bcmd_run = approval if isinstance(approval, str) else bcmd
+                cprint("dim", f"  Running: {bcmd_run}")
+                code, banner = run_command(bcmd_run, timeout=120)
+                session.commands.append(CommandRecord(
+                    phase=session.phase, command=bcmd_run, exit_code=code,
+                    output=banner, useful=(code == 0 and bool(banner.strip())),
+                    note=f"banner grab port {port}",
+                ))
+                print(banner)
+                cprint("dim", "  Generating service-specific checks...")
+                checks = generate_dynamic_checks(
+                    client, session, port, distill_output(bcmd_run, banner),
+                )
+                if not checks:
+                    cprint("red", "  AI produced no usable checks for this service.")
+                    continue
+                cprint("cyan", f"  AI proposed {len(checks)} checks for port {port}:")
+                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
             continue
 
         if user_input == ":ports":
@@ -1942,7 +2464,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             else:
                 cprint("red", "  Auto-enum available for: recon, enum, privesc")
                 continue
-            run_auto_checks(checks, session, client, execute_cmd)
+            run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
             continue
 
         if user_input == ":findings":
@@ -1999,21 +2521,27 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         # --- AI interaction ---
         cprint("dim", "  Thinking...")
-        system, prompt = build_ai_prompt(session, user_input)
+        structured = getattr(client, "structured", False)
+        system, prompt = build_ai_prompt(session, user_input, structured=structured)
         try:
-            raw = client.run_phase(session.phase, prompt, system)
+            raw = client.run_phase(session.phase, prompt, system, want_json=structured)
         except ConnectionError as exc:
             cprint("red", f"  AI error: {exc}")
             continue
 
         ai = parse_ai_response(raw)
 
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("CMD:"):
-                continue
-            if stripped:
-                print(f"  {line}")
+        if structured:
+            for line in ai.text.splitlines():
+                if line.strip():
+                    print(f"  {line}")
+        else:
+            for line in raw.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("CMD:"):
+                    continue
+                if stripped:
+                    print(f"  {line}")
 
         for f in ai.findings:
             if f not in session.findings:
@@ -2061,11 +2589,11 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             analysis_prompt = (
                 f"Command executed: {cmd_to_run}\n"
                 f"Exit code: {code}\n"
-                f"Output:\n{output[:MAX_AI_CONTEXT // 3]}\n\n"
+                f"Output:\n{distill_output(cmd_to_run, output)}\n\n"
                 f"Analyze this output. What did we learn? What should we try next?"
             )
             try:
-                analysis = client.analyze(analysis_prompt, system)
+                analysis = client.analyze(analysis_prompt, system, want_json=structured)
             except ConnectionError:
                 analysis = ""
 
@@ -2078,10 +2606,15 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             if analysis_parsed.access_line:
                 cprint("yellow", f"\n  ACCESS ONE-LINER: {analysis_parsed.access_line}")
 
-            for line in analysis.splitlines():
-                stripped = line.strip()
-                if stripped and not stripped.startswith(("CMD:", "FINDING:", "ACCESS:")):
-                    print(f"  {line}")
+            if structured:
+                for line in analysis_parsed.text.splitlines():
+                    if line.strip():
+                        print(f"  {line}")
+            else:
+                for line in analysis.splitlines():
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith(("CMD:", "FINDING:", "ACCESS:")):
+                        print(f"  {line}")
 
             if analysis_parsed.command:
                 rec.note = f"Next suggested: {analysis_parsed.command[:80]}"
@@ -2130,6 +2663,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Role mapping file (default: roles.json)")
     p.add_argument("--role", action="append", default=[], metavar="ROLE=MODEL",
                    help="Set a role mapping (e.g. --role recon=llama3.1:8b)")
+    p.add_argument("--no-structured", action="store_true",
+                   help="Disable schema-constrained JSON responses; use the legacy CMD: text protocol")
+    p.add_argument("--parallel", action="store_true",
+                   help="Run auto-enum checks concurrently after one batch approval")
     return p
 
 
@@ -2151,7 +2688,7 @@ def main() -> int:
             backend="ollama", base_url=base_url, api_key="",
             planner_model=args.planner_model,
             executor_model=args.executor_model,
-            roles=roles,
+            roles=roles, structured=not args.no_structured,
         )
     elif args.api == "openai":
         if not api_key:
@@ -2163,7 +2700,7 @@ def main() -> int:
         client = AIBackend(
             backend="openai", base_url=base_url, api_key=api_key,
             planner_model=planner, executor_model=executor,
-            roles=roles,
+            roles=roles, structured=not args.no_structured,
         )
         print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
         print("    Do NOT use on engagements with strict data-handling requirements.")
@@ -2177,7 +2714,7 @@ def main() -> int:
         client = AIBackend(
             backend="anthropic", base_url=base_url, api_key=api_key,
             planner_model=planner, executor_model=executor,
-            roles=roles,
+            roles=roles, structured=not args.no_structured,
         )
         print("[!] WARNING: Cloud API mode — command outputs are sent to external servers.")
         print("    Do NOT use on engagements with strict data-handling requirements.")
@@ -2257,13 +2794,25 @@ def main() -> int:
         )
 
     try:
-        interactive_loop(client, session, scope, args.report_dir)
+        interactive_loop(client, session, scope, args.report_dir, parallel=args.parallel)
     except KeyboardInterrupt:
         print("\n[*] Interrupted.")
     finally:
+        if session.ssh:
+            session.ssh.close()
         if session.commands:
             path = generate_report(session, args.report_dir)
             print(f"\n[*] Report saved: {path}")
+            # Auto-save the full session JSON (untruncated outputs) so the raw
+            # evidence always survives on disk, not just the distilled copy.
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            sess_path = os.path.join(
+                "sessions", f"session_{session.target.replace('.', '_')}_{ts}.json")
+            try:
+                session.save_to_file(sess_path)
+                print(f"[*] Full session saved: {sess_path}")
+            except OSError as exc:
+                print(f"[!] Could not auto-save session: {exc}")
             if not args.no_memory:
                 mem_path = save_project_memory(session)
                 print(f"[*] Project memory saved: {mem_path}")

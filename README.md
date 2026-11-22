@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.5
+   PENTEST AI ORCHESTRATOR  v0.6
    by sudoxs
 ```
 
@@ -30,6 +30,17 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v0.6
+
+Built to keep small local models (7B/8B) sharp under real engagement load:
+
+- **Context retrieval (RAG)** — instead of dumping every cheat sheet and every past output and truncating, a pure-stdlib TF-IDF retriever feeds the model only the notes and evidence relevant to what you just asked. No embeddings, no dependencies.
+- **Output distillation** — huge tool output (nmap, enum4linux, linpeas) is condensed to the signal-dense lines (open ports, `VULNERABLE`, creds, errors) plus context before it reaches the model. The **full, untouched output is always kept** in the report and the auto-saved session JSON — distillation only trims the copy sent to the AI.
+- **Structured JSON responses** — the model replies with a schema-constrained JSON object (Ollama `format`, OpenAI `response_format`, Anthropic prefill), which cuts format errors on small models. A tolerant parser handles fenced/prose-wrapped JSON and unescaped control characters, and automatically falls back to the legacy `CMD:` protocol. Disable with `--no-structured`.
+- **Dynamic service discovery** — `:svc <port>` on a port with no built-in checklist now banner-grabs the service and asks the AI for tailored, read-only checks. Unusual services and non-standard ports stop getting generic suggestions.
+- **Parallel auto-enum** — `--parallel` runs independent enumeration checks concurrently after a single batch approval (3 at a time), speeding up the slow I/O-bound scans without breaking the per-command approval model.
+- **Persistent SSH** — remote commands reuse one multiplexed master connection (ControlMaster/ControlPersist), with stale-socket cleanup so a dropped session never blocks the next connect.
 
 ## Quick Start
 
@@ -103,6 +114,8 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--no-memory` | | Don't load/save project memory |
 | `--roles` | `roles.json` | Role mapping config file |
 | `--role` | | Inline role mapping (e.g. `--role recon=llama3.1:8b`) |
+| `--no-structured` | | Disable schema-constrained JSON responses; use the legacy `CMD:` text protocol |
+| `--parallel` | | Run auto-enum checks concurrently after one batch approval |
 
 ### Role Mapping (Multi-Model)
 
@@ -192,9 +205,9 @@ Once inside the client, you have these commands:
 |---------|-------------|
 | `:scan` | Quick nmap scan (top 100 ports) |
 | `:fullscan` | Full nmap scan (all 65535 ports) |
-| `:auto` | Run auto-enum checks for current phase |
+| `:auto` | Run auto-enum checks for current phase (use `--parallel` for concurrent batch mode) |
 | `:ports` | Detect open ports and show available service checks |
-| `:svc <port>` | Run service-specific enum for a port (e.g. `:svc 445`) |
+| `:svc <port>` | Service-specific enum for a port (e.g. `:svc 445`); unknown ports → AI-generated dynamic checks |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 
@@ -318,7 +331,22 @@ Use `:tools` to see relevant suggestions for your current phase and OS.
 
 ## AI Protocol
 
-The AI communicates using these tags:
+By default (v0.6+) the model replies with a schema-constrained JSON object:
+
+```json
+{
+  "message": "short analysis / next step",
+  "command": "one command to run next, or null",
+  "findings": ["notable discovery", ...],
+  "needs": ["info needed from operator", ...],
+  "access": "initial-access one-liner, or null",
+  "tools": ["download-only tool — what it does", ...],
+  "done": false,
+  "done_summary": ""
+}
+```
+
+The parser tolerates fenced/prose-wrapped JSON and unescaped control characters, and automatically falls back to the legacy tag protocol below (also used when you pass `--no-structured`):
 
 | Tag | Meaning |
 |-----|---------|
@@ -331,7 +359,7 @@ The AI communicates using these tags:
 
 ## Cheat Sheets
 
-Put your engagement notes in `cheatsheets/` as `.md` or `.txt` files. The AI loads them all automatically for context.
+Put your engagement notes in `cheatsheets/` as `.md` or `.txt` files. xs-ai loads them all and, per prompt, retrieves only the chunks relevant to what you're asking (v0.6) — so you can keep large note collections without flooding the model's context window.
 
 ```markdown
 # My Engagement Notes
@@ -442,6 +470,8 @@ Reports are generated as markdown in `reports/` with:
 - Useful results with full output
 - Complete command history table
 - Commands that produced no results
+
+Reports store the **full captured output** of every command, never the distilled copy the AI sees. On exit, xs-ai also auto-saves the complete session JSON (untruncated outputs) under `sessions/`, so the raw evidence always survives on disk.
 
 Generated automatically on `:quit` or manually with `:report`.
 
