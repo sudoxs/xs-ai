@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.1
+   PENTEST AI ORCHESTRATOR  v1.2
    by sudoxs
 ```
 
@@ -30,6 +30,13 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.2
+
+Milestone 5 — **model-agnostic registry + secure connection modes**:
+
+- **Multi-model registry** (`providers.py`, `models.json`) — declare any number of models, each with its provider (Ollama / OpenAI / Anthropic), endpoint, context size and capabilities. Assign models to roles, or let xs-ai **auto-select** by capability and context, with **graceful fallback** when a model is unavailable. Works with a single local model, several local models, or a mix of local and cloud — no GPU/VRAM assumptions. Copy `models.example.json` → `models.json` to activate; `:models` shows the routing. Without it, the existing single-backend mode is unchanged.
+- **Connection modes** (`connection.py`, `--connect-mode`): **direct** (existing; warns on network exposure), **ssh-tunnel** (Ollama stays bound to localhost, reached over an SSH forward — the exact command is printed), and **vpn** (WireGuard/Tailscale overlay IP). Each prints its trust boundaries, and a connection diagnostic reports reachability, latency, and exposure. A VPN protects transport, not the Ollama API — stated explicitly.
 
 ## What's New in v1.1
 
@@ -168,6 +175,8 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--online` | | Allow the research engine to query external sources (e.g. NVD); off by default (offline KB only) |
 | `--cred-attempts` | `3` | Max validation attempts per hypothesis (no brute-force) |
 | `--cred-delay` | `0` | Seconds between validation attempts |
+| `--models` | `models.json` | Multi-model registry file; when present, routes roles across models |
+| `--connect-mode` | `direct` | Connection mode: `direct`, `ssh-tunnel`, or `vpn` |
 
 ### Role Mapping (Multi-Model)
 
@@ -274,6 +283,7 @@ Once inside the client, you have these commands:
 |---------|-------------|
 | `:memory` | Save project memory (project.md) for next session |
 | `:roles` | Show/set model-to-role mapping for each phase |
+| `:models` | Show the multi-model registry and role routing |
 | `:memory show` | Display current project memory |
 
 #### Session Management
@@ -579,6 +589,9 @@ Generated automatically on `:quit` or manually with `:report`.
 xs-ai/
 ├── client.py           # Main interactive client (Kali)
 ├── research.py         # Service Research Engine (optional; imported if present)
+├── providers.py        # Multi-model registry + routing (optional)
+├── connection.py       # Connection modes + diagnostics (optional)
+├── models.example.json # Copy to models.json to enable multi-model routing
 ├── knowledge/          # Extensible per-service research modules (*.json)
 │   ├── http.json
 │   ├── ssh.json

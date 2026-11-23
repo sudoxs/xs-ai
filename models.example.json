@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy to models.json to enable multi-model routing. Each role is sent to the assigned model; unassigned roles are auto-selected by capability/context. Works with a single entry too.",
+  "models": [
+    {
+      "name": "planner-big",
+      "provider": "ollama",
+      "model": "llama3.1:70b",
+      "endpoint": "http://192.168.198.1:11434",
+      "context": 16384,
+      "capabilities": ["reasoning", "structured"],
+      "roles": ["planner", "lead_researcher", "attack_chain_analyst", "report_analyst"]
+    },
+    {
+      "name": "coder",
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "endpoint": "http://192.168.198.1:11434",
+      "context": 32768,
+      "capabilities": ["structured", "fast"],
+      "roles": ["analyzer", "service_researcher", "web_researcher", "recon_analyst"]
+    },
+    {
+      "name": "cloud-claude",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "api_key_env": "XS_API_KEY",
+      "context": 200000,
+      "capabilities": ["reasoning", "structured", "tools"],
+      "roles": ["vuln_analyst"]
+    }
+  ],
+  "default": "coder"
+}

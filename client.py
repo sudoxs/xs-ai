@@ -34,6 +34,14 @@ try:
     import research  # Service Research Engine (optional — graceful if absent)
 except ImportError:
     research = None  # type: ignore
+try:
+    import providers  # multi-model registry (optional)
+except ImportError:
+    providers = None  # type: ignore
+try:
+    import connection  # connection modes + diagnostics (optional)
+except ImportError:
+    connection = None  # type: ignore
 import shlex
 import socket
 import subprocess
@@ -106,7 +114,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.1
+   PENTEST AI ORCHESTRATOR  v1.2
    by sudoxs
 """
 
@@ -2434,6 +2442,7 @@ def show_help():
       :hypotheses         List recorded research hypotheses
       :validate <id>      Safely validate one hypothesis (approval + attempt-limited)
       :chains             Link findings/hypotheses into attack-chain scenarios
+      :models             Show model registry / routing (multi-model setups)
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
       :help               Show this help
@@ -2911,6 +2920,18 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("dim", "  Usage: :roles [<role> <model>] [save|clear|rm <role>]")
             continue
 
+        if user_input == ":models":
+            reg = getattr(client, "registry", None)
+            if reg is None:
+                cprint("dim", "  Single-backend mode (no model registry).")
+                cprint("dim", f"    planner : {getattr(client, 'planner_model', '?')}")
+                cprint("dim", f"    analyzer: {getattr(client, 'executor_model', '?')}")
+                cprint("dim", "    Add a models.json to enable multi-model routing (see README).")
+            else:
+                cprint("cyan", "  Model registry:")
+                print(reg.status())
+            continue
+
         if user_input.startswith(":auto"):
             auto_redo = "redo" in user_input.split()[1:]
             if session.phase == "recon":
@@ -3317,6 +3338,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max validation attempts per hypothesis (no brute-force; default 3)")
     p.add_argument("--cred-delay", type=float, default=0.0,
                    help="Seconds to wait between validation attempts (default 0)")
+    p.add_argument("--models", default="models.json",
+                   help="Model registry file for multi-model routing (default: models.json). "
+                        "When present, overrides --planner-model/--executor-model with registry routing")
+    p.add_argument("--connect-mode", choices=("direct", "ssh-tunnel", "vpn"), default="direct",
+                   help="Connection mode to the AI host: direct (existing), ssh-tunnel "
+                        "(Ollama stays on localhost), or vpn (private overlay IP)")
     return p
 
 
@@ -3334,10 +3361,18 @@ def main() -> int:
             k, v = entry.split("=", 1)
             roles.set_role(k.strip(), v.strip())
 
+    # -- Connection mode (keep DIRECT; add SSH tunnel / VPN) --
+    eff_host, eff_port = args.host, args.port
+    if connection is not None:
+        eff_host, eff_port, guidance = connection.resolve(args.connect_mode, args.host, args.port)
+        print(f"[*] Connection mode: {args.connect_mode}")
+        for line in guidance:
+            print(f"    {line}")
+
     # -- Build AI backend --
     api_key = args.api_key or os.environ.get("XS_API_KEY", "")
     if args.api == "ollama":
-        base_url = args.api_url or f"http://{args.host}:{args.port}"
+        base_url = args.api_url or f"http://{eff_host}:{eff_port}"
         client = AIBackend(
             backend="ollama", base_url=base_url, api_key="",
             planner_model=args.planner_model,
@@ -3376,10 +3411,35 @@ def main() -> int:
         print(f"[FAIL] Unknown API backend: {args.api}")
         return 1
 
+    # -- Optional multi-model registry (overrides single-backend routing) --
+    if providers is not None:
+        registry = providers.load_registry(args.models)
+        if registry.models:
+            default_eps = {"ollama": f"http://{eff_host}:{eff_port}",
+                           "openai": "https://api.openai.com/v1",
+                           "anthropic": "https://api.anthropic.com/v1"}
+
+            def _make(spec):
+                key = os.environ.get(spec.api_key_env, "") if spec.api_key_env else api_key
+                ep = spec.endpoint or default_eps.get(spec.provider, "")
+                return AIBackend(
+                    backend=spec.provider, base_url=ep, api_key=key,
+                    planner_model=spec.model, executor_model=spec.model,
+                    roles=RoleMap(), structured=not args.no_structured)
+
+            client = providers.RegistryBackend(
+                registry, _make, structured=not args.no_structured, roles=roles)
+            print(f"[OK] Model registry active ({len(registry.models)} models) — "
+                  f"routing roles via {args.models}")
+
     if roles.mapping:
         print(f"[OK] Role overrides loaded ({len(roles.mapping)} roles)")
         for r, m in roles.mapping.items():
             print(f"     {r} -> {m}")
+
+    if connection is not None and args.api == "ollama":
+        ok, msg = connection.diagnose(eff_host, eff_port)
+        print(f"[{'OK' if ok else '!'}] Connection check {eff_host}:{eff_port} — {msg}")
 
     print(f"[*] Connecting to {args.api} at {client.base_url}...")
     try:
