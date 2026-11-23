@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.6
+   PENTEST AI ORCHESTRATOR  v0.7
    by sudoxs
 ```
 
@@ -30,6 +30,13 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v0.7
+
+Engagement memory and multi-operator handoff:
+
+- **Re-test guard** — xs-ai remembers every command already run (including work imported from another analyst). Before re-running one, it warns and asks for separate confirmation, and `:auto` / `:svc` skip already-completed checks by default. Force a repeat with `:auto redo` or `:svc <port> redo`.
+- **Handoff bundles** — `:export [file]` writes a self-contained bundle (target, phase, OS, credentials, findings, full command history, embedded project memory). Another operator runs `:import <file>` (or `--import FILE` at startup) to **merge** it into their own session. Commands are de-duplicated by normalized command + phase, so overlapping or repeated imports never double-count — and the merged history immediately feeds *their* re-test guard, so they never redo what you already did. Imported commands are tagged `[from <file>]` and the final report gains a "Continued from" line.
 
 ## What's New in v0.6
 
@@ -116,6 +123,7 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--role` | | Inline role mapping (e.g. `--role recon=llama3.1:8b`) |
 | `--no-structured` | | Disable schema-constrained JSON responses; use the legacy `CMD:` text protocol |
 | `--parallel` | | Run auto-enum checks concurrently after one batch approval |
+| `--import` | | Merge another operator's handoff bundle at startup (repeatable) |
 
 ### Role Mapping (Multi-Model)
 
@@ -205,9 +213,9 @@ Once inside the client, you have these commands:
 |---------|-------------|
 | `:scan` | Quick nmap scan (top 100 ports) |
 | `:fullscan` | Full nmap scan (all 65535 ports) |
-| `:auto` | Run auto-enum checks for current phase (use `--parallel` for concurrent batch mode) |
+| `:auto [redo]` | Run auto-enum checks for current phase (use `--parallel` for concurrent batch mode). `redo` re-runs checks already done |
 | `:ports` | Detect open ports and show available service checks |
-| `:svc <port>` | Service-specific enum for a port (e.g. `:svc 445`); unknown ports → AI-generated dynamic checks |
+| `:svc <port> [redo]` | Service-specific enum for a port (e.g. `:svc 445`); unknown ports → AI-generated dynamic checks. `redo` re-runs completed checks |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 
@@ -227,7 +235,9 @@ Once inside the client, you have these commands:
 | `:history` | Show full command history |
 | `:report` | Generate markdown report |
 | `:save [file]` | Save session state to JSON |
-| `:load <file>` | Load a saved session |
+| `:load <file>` | Load a saved session (replaces current) |
+| `:export [file]` | Export a handoff bundle to share with another operator |
+| `:import <file>` | Merge another operator's bundle into the current session |
 | `:cheat <file>` | Load an additional cheat sheet |
 
 ## Pentest Workflow
@@ -460,6 +470,35 @@ Load a previous session:
 ```bash
 python3 client.py --host 192.168.198.1 --load sessions/dante_box1.json
 ```
+
+## Engagement Handoff & Re-test Guard
+
+xs-ai remembers what has already been run and lets you hand a partially-completed engagement to another operator.
+
+**Re-test guard** — every command is recorded. Before re-running one, xs-ai warns and asks for separate confirmation; `:auto` and `:svc` skip already-completed checks by default. Force a repeat with `redo`:
+
+```
+[enum]> :auto                # skips checks already done, runs only new ones
+[enum]> :auto redo           # re-runs everything
+[enum]> :svc 445 redo        # re-run SMB checks even if done before
+```
+
+**Handoff** — operator A exports a bundle; operator B imports it and continues:
+
+```
+# Operator A, after some testing
+[enum]> :export                      # sessions/handoff_10_10_110_5_<ts>.json
+# ...sends the file to operator B...
+
+# Operator B, on their own machine
+python3 client.py --host 192.168.198.1 --import handoff_10_10_110_5.json
+# or at runtime:
+[recon]> :import handoff_10_10_110_5.json
+  Imported from handoff_10_10_110_5.json:
+    +12 commands, +4 findings, +1 credentials
+```
+
+The bundle carries target, phase, OS, credentials, findings, the full command history, and the embedded project memory. On import, commands are de-duplicated by normalized command + phase (so overlapping or repeated imports never double-count), and the merged history immediately drives operator B's re-test guard — they won't redo what A already did. Imported commands are tagged `[from <file>]`, and the final report gains a "Continued from" line recording the handoff.
 
 ## Reports
 

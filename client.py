@@ -77,7 +77,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.6
+   PENTEST AI ORCHESTRATOR  v0.7
    by sudoxs
 """
 
@@ -1374,6 +1374,95 @@ class Session:
     credentials: dict = field(default_factory=dict)
     ssh: SSHConnection | None = None
     target_os: str = ""  # linux, windows, or empty
+    imported_from: list[str] = field(default_factory=list)  # handoff provenance
+
+    @staticmethod
+    def _norm_cmd(cmd: str) -> str:
+        return " ".join(cmd.split())
+
+    def prior_run(self, command: str, successful_only: bool = False) -> CommandRecord | None:
+        """Return the most recent prior run of the same command, if any.
+
+        Powers the re-test guard: before running a command, we check whether it
+        (or an imported record of it) already ran, so the operator isn't silently
+        repeating work carried over from earlier or from another analyst."""
+        norm = self._norm_cmd(command)
+        match: CommandRecord | None = None
+        for rec in self.commands:
+            if self._norm_cmd(rec.command) == norm and (not successful_only or rec.useful):
+                match = rec
+        return match
+
+    def _commands_as_dicts(self) -> list[dict]:
+        return [
+            {
+                "phase": r.phase, "command": r.command, "exit_code": r.exit_code,
+                "output": r.output, "useful": r.useful, "note": r.note,
+                "remote": r.remote,
+            }
+            for r in self.commands
+        ]
+
+    def merge_from(self, data: dict, source: str = "") -> dict:
+        """Merge another analyst's saved session / export bundle into this one.
+
+        Commands are de-duplicated by normalized command + phase, so re-importing
+        or overlapping histories never double-count. The merged command history
+        then feeds the re-test guard automatically."""
+        stats = {"commands": 0, "findings": 0, "credentials": 0}
+        if not self.target and data.get("target"):
+            self.target = data["target"]
+        if not self.target_os and data.get("target_os"):
+            self.target_os = data["target_os"]
+        for k, v in (data.get("credentials") or {}).items():
+            if k not in self.credentials:
+                self.credentials[k] = v
+                stats["credentials"] += 1
+        for f in data.get("findings") or []:
+            if f not in self.findings:
+                self.findings.append(f)
+                stats["findings"] += 1
+        existing = {(self._norm_cmd(r.command), r.phase) for r in self.commands}
+        src = source or data.get("exported_by") or "import"
+        for rec in data.get("commands") or []:
+            key = (self._norm_cmd(rec.get("command", "")), rec.get("phase", ""))
+            if not key[0] or key in existing:
+                continue
+            existing.add(key)
+            note = rec.get("note", "")
+            tag = f"[from {src}]"
+            note = note if tag in note else f"{tag} {note}".strip()
+            self.commands.append(CommandRecord(
+                phase=rec.get("phase", "recon"), command=rec["command"],
+                exit_code=rec.get("exit_code", 0), output=rec.get("output", ""),
+                useful=rec.get("useful", False), note=note,
+                remote=rec.get("remote", False),
+            ))
+            stats["commands"] += 1
+        stamp = data.get("exported_at") or data.get("saved_at") or "?"
+        label = f"{src} @ {stamp}"
+        if label not in self.imported_from:
+            self.imported_from.append(label)
+        return stats
+
+    def export_bundle(self, filepath: str) -> str:
+        """Write a self-contained handoff bundle another operator can :import."""
+        data = {
+            "xs_ai_bundle": "1.0",
+            "exported_at": datetime.datetime.now().isoformat(),
+            "target": self.target,
+            "phase": self.phase,
+            "target_os": self.target_os,
+            "credentials": self.credentials,
+            "findings": self.findings,
+            "commands": self._commands_as_dicts(),
+            "imported_from": self.imported_from,
+            "project_memory": generate_project_memory(self),
+        }
+        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return filepath
 
     def evidence_summary(self, distill: bool = False) -> str:
         parts: list[str] = []
@@ -1401,14 +1490,8 @@ class Session:
             "target_os": self.target_os,
             "credentials": self.credentials,
             "findings": self.findings,
-            "commands": [
-                {
-                    "phase": r.phase, "command": r.command,
-                    "exit_code": r.exit_code, "output": r.output,
-                    "useful": r.useful, "note": r.note, "remote": r.remote,
-                }
-                for r in self.commands
-            ],
+            "commands": self._commands_as_dicts(),
+            "imported_from": self.imported_from,
             "saved_at": datetime.datetime.now().isoformat(),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -1426,6 +1509,7 @@ class Session:
             credentials=data.get("credentials", {}),
             findings=data.get("findings", []),
             target_os=data.get("target_os", ""),
+            imported_from=data.get("imported_from", []),
         )
         for rec in data.get("commands", []):
             session.commands.append(CommandRecord(
@@ -1771,6 +1855,10 @@ def generate_report(session: Session, output_dir: str) -> str:
         f"| Date | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} |",
         f"| Commands | {len(session.commands)} total, {len(useful)} useful |",
         f"| Credentials used | {'yes' if session.credentials else 'no'} |",
+    ]
+    if session.imported_from:
+        lines.append(f"| Continued from | {'; '.join(session.imported_from)} |")
+    lines += [
         "",
         "---",
         "",
@@ -1841,9 +1929,11 @@ def prompt_input(label: str = "xs-ai") -> str:
         return ":quit"
 
 
-def approve(cmd: str, remote: bool = False) -> bool | str:
+def approve(cmd: str, remote: bool = False, warn: str = "") -> bool | str:
     where = " (REMOTE)" if remote else ""
     cprint("yellow", f"\n  Command{where}: {cmd}")
+    if warn:
+        cprint("magenta", f"  ⚠ {warn}")
     try:
         ans = input(f"  {COLOR['bold']}Execute? [y/n/edit]:{COLOR['reset']} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -1857,6 +1947,12 @@ def approve(cmd: str, remote: bool = False) -> bool | str:
         except (EOFError, KeyboardInterrupt):
             return False
     return ans in ("y", "yes")
+
+
+def prior_warning(rec: CommandRecord) -> str:
+    status = "succeeded" if rec.useful else f"exit {rec.exit_code}"
+    note = f" — {rec.note}" if rec.note else ""
+    return f"already run earlier ([{rec.phase}]{note}, {status})"
 
 
 # ---------------------------------------------------------------------------
@@ -1903,11 +1999,25 @@ def generate_dynamic_checks(client, session: Session, port: str,
 
 
 def _run_checks_parallel(checks: list[tuple[str, str]], session: Session,
-                         execute_fn) -> list[CommandRecord]:
+                         execute_fn, redo: bool = False) -> list[CommandRecord]:
     """Run independent checks concurrently after a single batch approval."""
     from concurrent.futures import ThreadPoolExecutor
 
     cmds = [(title, tmpl.format(target=session.target)) for title, tmpl in checks]
+    # re-test guard: drop checks already run successfully, unless redo is set
+    if not redo:
+        kept, skipped = [], 0
+        for title, cmd in cmds:
+            if session.prior_run(cmd, successful_only=True):
+                skipped += 1
+            else:
+                kept.append((title, cmd))
+        if skipped:
+            cprint("magenta", f"  ⚠ Skipping {skipped} check(s) already run earlier (use 'redo' to force).")
+        cmds = kept
+    if not cmds:
+        cprint("dim", "  Nothing new to run.")
+        return []
     cprint("yellow", f"\n  Parallel auto-enum — {len(cmds)} independent checks:")
     for i, (title, cmd) in enumerate(cmds, 1):
         cprint("dim", f"    [{i}] {title}: {cmd}")
@@ -1944,9 +2054,9 @@ def _run_checks_parallel(checks: list[tuple[str, str]], session: Session,
 
 def run_auto_checks(checks: list[tuple[str, str]], session: Session,
                     client: OllamaClient | AIBackend | None, execute_fn,
-                    parallel: bool = False) -> list[CommandRecord]:
+                    parallel: bool = False, redo: bool = False) -> list[CommandRecord]:
     if parallel:
-        results = _run_checks_parallel(checks, session, execute_fn)
+        results = _run_checks_parallel(checks, session, execute_fn, redo=redo)
     else:
         results = []
         cprint("cyan", f"\n  Auto-enum: {len(checks)} checks available")
@@ -1954,7 +2064,12 @@ def run_auto_checks(checks: list[tuple[str, str]], session: Session,
         for i, (title, cmd_template) in enumerate(checks, 1):
             cmd = cmd_template.format(target=session.target)
             cprint("cyan", f"\n  [{i}/{len(checks)}] {title}")
-            approval = approve(cmd, remote=bool(session.ssh))
+            prior = session.prior_run(cmd, successful_only=True)
+            if prior and not redo:
+                cprint("magenta", f"  ⚠ {prior_warning(prior)} — skipping (use 'redo' to force).")
+                continue
+            approval = approve(cmd, remote=bool(session.ssh),
+                               warn=prior_warning(prior) if prior else "")
             if approval is False:
                 cprint("dim", "  Skipped.")
                 continue
@@ -2048,8 +2163,12 @@ def show_help():
       :history            Show command history
       :report             Generate report
       :save [file]        Save session state
-      :load <file>        Load saved session
+      :load <file>        Load saved session (replaces current)
+      :export [file]      Export a handoff bundle to share with another operator
+      :import <file>      Merge another operator's bundle into this session
       :cheat <file>       Load additional cheat sheet
+      :auto [redo]        Run auto-enum; 'redo' re-runs checks already done
+      :svc <port> [redo]  Service enum; 'redo' re-runs checks already done
       :status             Show current session status
       :help               Show this help
       :quit               Exit
@@ -2279,7 +2398,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         if user_input == ":scan":
             cmd = f"nmap -Pn -sV --version-light --top-ports 100 -T3 {session.target}"
-            approval = approve(cmd)
+            _prior = session.prior_run(cmd, successful_only=True)
+            approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
             if approval is not False:
                 cmd_to_run = approval if isinstance(approval, str) else cmd
                 cprint("dim", f"  Running: {cmd_to_run}")
@@ -2295,7 +2415,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         if user_input == ":fullscan":
             cmd = f"nmap -Pn -p- -T4 --min-rate 1000 {session.target}"
-            approval = approve(cmd)
+            _prior = session.prior_run(cmd, successful_only=True)
+            approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
             if approval is not False:
                 cmd_to_run = approval if isinstance(approval, str) else cmd
                 cprint("dim", f"  Running: {cmd_to_run}")
@@ -2310,17 +2431,19 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             continue
 
         if user_input.startswith(":svc"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                cprint("red", "  Usage: :svc <port>  (e.g. :svc 445)")
+            tokens = user_input.split()
+            if len(tokens) < 2:
+                cprint("red", "  Usage: :svc <port> [redo]  (e.g. :svc 445)")
                 cprint("dim", f"  Built-in ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
                 cprint("dim", "  Any other port -> AI generates dynamic checks from the banner.")
+                cprint("dim", "  Add 'redo' to re-run checks already done earlier.")
                 continue
-            port = parts[1].strip()
+            port = tokens[1].strip()
+            svc_redo = "redo" in tokens[2:]
             if port in SERVICE_PORT_MAP:
                 checks = SERVICE_PORT_MAP[port]
                 cprint("cyan", f"  Service enum for port {port}:")
-                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
+                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
             else:
                 cprint("yellow", f"  No built-in checklist for port {port} — asking AI for dynamic checks.")
                 bcmd = f"nmap -Pn -sV -p{port} {session.target}"
@@ -2344,7 +2467,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     cprint("red", "  AI produced no usable checks for this service.")
                     continue
                 cprint("cyan", f"  AI proposed {len(checks)} checks for port {port}:")
-                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
+                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
             continue
 
         if user_input == ":ports":
@@ -2451,7 +2574,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("dim", "  Usage: :roles [<role> <model>] [save|clear|rm <role>]")
             continue
 
-        if user_input == ":auto":
+        if user_input.startswith(":auto"):
+            auto_redo = "redo" in user_input.split()[1:]
             if session.phase == "recon":
                 checks = RECON_CHECKS
             elif session.phase == "enum":
@@ -2464,7 +2588,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             else:
                 cprint("red", "  Auto-enum available for: recon, enum, privesc")
                 continue
-            run_auto_checks(checks, session, client, execute_cmd, parallel=parallel)
+            run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=auto_redo)
             continue
 
         if user_input == ":findings":
@@ -2508,6 +2632,35 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("green", f"  Loaded session: {loaded.target}, {len(loaded.commands)} commands, phase={loaded.phase}")
             except Exception as exc:
                 cprint("red", f"  Load failed: {exc}")
+            continue
+
+        if user_input.startswith(":export"):
+            parts = user_input.split(maxsplit=1)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = parts[1] if len(parts) == 2 else f"sessions/handoff_{session.target.replace('.','_')}_{ts}.json"
+            try:
+                session.export_bundle(filepath)
+                cprint("green", f"  Handoff bundle exported: {filepath}")
+                cprint("dim", "  Share this file — the other operator runs :import <file> to continue.")
+            except OSError as exc:
+                cprint("red", f"  Export failed: {exc}")
+            continue
+
+        if user_input.startswith(":import"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) != 2:
+                cprint("red", "  Usage: :import <file>  (merge another operator's handoff bundle)")
+                continue
+            try:
+                with open(parts[1].strip(), encoding="utf-8") as f:
+                    data = json.load(f)
+                src = os.path.basename(parts[1].strip())
+                stats = session.merge_from(data, source=src)
+                cprint("green", f"  Imported from {src}:")
+                cprint("green", f"    +{stats['commands']} commands, +{stats['findings']} findings, +{stats['credentials']} credentials")
+                cprint("dim", "  Their history now drives the re-test guard — already-done checks will be skipped.")
+            except Exception as exc:
+                cprint("red", f"  Import failed: {exc}")
             continue
 
         if user_input.startswith(":cheat"):
@@ -2565,7 +2718,9 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         if ai.command:
             is_remote = bool(session.ssh)
-            approval = approve(ai.command, remote=is_remote)
+            _prior = session.prior_run(ai.command, successful_only=True)
+            approval = approve(ai.command, remote=is_remote,
+                               warn=prior_warning(_prior) if _prior else "")
             if approval is False:
                 cprint("dim", "  Skipped.")
                 continue
@@ -2667,6 +2822,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Disable schema-constrained JSON responses; use the legacy CMD: text protocol")
     p.add_argument("--parallel", action="store_true",
                    help="Run auto-enum checks concurrently after one batch approval")
+    p.add_argument("--import", dest="import_file", action="append", default=[],
+                   metavar="FILE",
+                   help="Merge another operator's handoff bundle at startup (repeatable)")
     return p
 
 
@@ -2792,6 +2950,18 @@ def main() -> int:
             cheatsheet_context=cheatsheet_ctx,
             target_os=args.os_type or "",
         )
+
+    # Merge any handoff bundles passed on the command line (another operator's work)
+    for imp in args.import_file:
+        try:
+            with open(imp, encoding="utf-8") as f:
+                data = json.load(f)
+            stats = session.merge_from(data, source=os.path.basename(imp))
+            print(f"[OK] Imported {os.path.basename(imp)}: "
+                  f"+{stats['commands']} commands, +{stats['findings']} findings, "
+                  f"+{stats['credentials']} credentials")
+        except Exception as exc:
+            print(f"[!] Could not import {imp}: {exc}")
 
     try:
         interactive_loop(client, session, scope, args.report_dir, parallel=args.parallel)
