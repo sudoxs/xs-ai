@@ -1,0 +1,27 @@
+{
+  "service": "redis",
+  "aliases": ["redis"],
+  "ports": [6379],
+  "notes": "Redis frequently ships with no authentication. An unauthenticated, network-exposed instance is high impact: data disclosure and, when writable, remote code execution via well-known techniques.",
+  "checks": [
+    {
+      "id": "redis-no-auth",
+      "title": "Unauthenticated Redis access",
+      "category": "authentication",
+      "severity": "critical",
+      "when": "INFO/CONFIG succeed without AUTH",
+      "validation": "Issue a single read-only INFO once with approval; if it succeeds without AUTH, access is anonymous. Do not modify data.",
+      "references": ["https://redis.io/docs/management/security/"]
+    },
+    {
+      "id": "redis-writable-rce",
+      "title": "Writable Redis — potential RCE",
+      "category": "configuration",
+      "severity": "critical",
+      "when": "unauthenticated and CONFIG SET / write is permitted",
+      "validation": "Confirm write access read-only first (CONFIG GET dir). Do NOT write keys/webshells without explicit operator approval and scope.",
+      "references": ["https://redis.io/docs/management/security/"]
+    }
+  ],
+  "default_credentials": []
+}

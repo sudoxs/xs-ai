@@ -30,6 +30,10 @@ try:
     import termios  # POSIX only — used to recover the TTY after subprocesses
 except ImportError:
     termios = None  # type: ignore
+try:
+    import research  # Service Research Engine (optional — graceful if absent)
+except ImportError:
+    research = None  # type: ignore
 import shlex
 import socket
 import subprocess
@@ -101,7 +105,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.8
+   PENTEST AI ORCHESTRATOR  v0.9
    by sudoxs
 """
 
@@ -1524,6 +1528,7 @@ class Session:
     ssh: SSHConnection | None = None
     target_os: str = ""  # linux, windows, or empty
     imported_from: list[str] = field(default_factory=list)  # handoff provenance
+    hypotheses: list[dict] = field(default_factory=list)  # research hypotheses
 
     @staticmethod
     def _norm_cmd(cmd: str) -> str:
@@ -1558,7 +1563,7 @@ class Session:
         Commands are de-duplicated by normalized command + phase, so re-importing
         or overlapping histories never double-count. The merged command history
         then feeds the re-test guard automatically."""
-        stats = {"commands": 0, "findings": 0, "credentials": 0}
+        stats = {"commands": 0, "findings": 0, "credentials": 0, "hypotheses": 0}
         if not self.target and data.get("target"):
             self.target = data["target"]
         if not self.target_os and data.get("target_os"):
@@ -1588,6 +1593,14 @@ class Session:
                 remote=rec.get("remote", False),
             ))
             stats["commands"] += 1
+        seen_h = {(h.get("service", ""), h.get("observation", "")) for h in self.hypotheses}
+        for h in data.get("hypotheses") or []:
+            key = (h.get("service", ""), h.get("observation", ""))
+            if key in seen_h:
+                continue
+            seen_h.add(key)
+            self.hypotheses.append(h)
+            stats["hypotheses"] += 1
         stamp = data.get("exported_at") or data.get("saved_at") or "?"
         label = f"{src} @ {stamp}"
         if label not in self.imported_from:
@@ -1606,6 +1619,7 @@ class Session:
             "findings": self.findings,
             "commands": self._commands_as_dicts(),
             "imported_from": self.imported_from,
+            "hypotheses": self.hypotheses,
             "project_memory": generate_project_memory(self),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -1641,6 +1655,7 @@ class Session:
             "findings": self.findings,
             "commands": self._commands_as_dicts(),
             "imported_from": self.imported_from,
+            "hypotheses": self.hypotheses,
             "saved_at": datetime.datetime.now().isoformat(),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -1659,6 +1674,7 @@ class Session:
             findings=data.get("findings", []),
             target_os=data.get("target_os", ""),
             imported_from=data.get("imported_from", []),
+            hypotheses=data.get("hypotheses", []),
         )
         for rec in data.get("commands", []):
             session.commands.append(CommandRecord(
@@ -2020,6 +2036,15 @@ def generate_report(session: Session, output_dir: str) -> str:
     else:
         lines.append("No findings recorded.")
 
+    if session.hypotheses:
+        lines += ["", "---", "", "## Research Hypotheses", "",
+                  "| ID | Service | Severity | Confidence | Status | Observation |",
+                  "|----|---------|----------|------------|--------|-------------|"]
+        for h in session.hypotheses:
+            obs = (h.get("observation", "") or "").replace("|", "\\|")[:80]
+            lines.append(f"| {h.get('id','')} | {h.get('service','')} | {h.get('severity','')} | "
+                         f"{h.get('confidence','')} | {h.get('status','')} | {obs} |")
+
     lines += ["", "---", "", "## Useful Results", ""]
     for rec in useful:
         prefix = " (remote)" if rec.remote else ""
@@ -2110,6 +2135,19 @@ def reset_terminal(flush: bool = False) -> None:
             termios.tcflush(fd, termios.TCIFLUSH)
     except Exception:
         pass
+
+
+def print_hypothesis(h) -> None:
+    cprint("yellow", f"  [{h.id}] {h.service} — {h.severity.upper()} severity / "
+                     f"{h.confidence} confidence / {h.status}")
+    if h.observation:
+        cprint("dim", f"       obs: {h.observation}")
+    if h.cves:
+        cprint("dim", f"       CVEs: {', '.join(h.cves)}")
+    if h.validation_plan:
+        cprint("green", f"       validate: {h.validation_plan}")
+    if h.references:
+        cprint("dim", f"       refs: {', '.join(h.references[:3])}")
 
 
 def prompt_input(label: str = "xs-ai") -> str:
@@ -2364,6 +2402,8 @@ def show_help():
       :cheat <file>       Load additional cheat sheet
       :auto [redo]        Run auto-enum; 'redo' re-runs checks already done
       :svc <port> [redo]  Service enum; 'redo' re-runs checks already done
+      :research <port>    Research a service → ranked vulnerability hypotheses
+      :hypotheses         List recorded research hypotheses
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
       :help               Show this help
@@ -2412,8 +2452,14 @@ def show_status(session: Session):
 
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
                      report_dir: str, parallel: bool = False,
-                     guard: ScopeGuard | None = None):
+                     guard: ScopeGuard | None = None, online: bool = False):
     guard = guard or ScopeGuard(allow_any=True)  # back-compat if not supplied
+    research_engine = None
+    if research is not None:
+        research_engine = research.ResearchEngine(
+            sources=research.default_sources("knowledge", session.cheatsheet_context),
+            online=online,
+        )
     cprint("cyan", BANNER)
     cprint("green", f"  Connected to: {client.base_url}")
     cprint("green", f"  Target: {session.target}")
@@ -2850,6 +2896,61 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=auto_redo)
             continue
 
+        if user_input.startswith(":research"):
+            if research is None or research_engine is None:
+                cprint("red", "  Research engine unavailable (research.py not found).")
+                continue
+            tokens = user_input.split()
+            if len(tokens) < 2:
+                cprint("red", "  Usage: :research <port>  (e.g. :research 8080)")
+                continue
+            port = tokens[1].strip()
+            nmap_out = "\n".join(r.output for r in session.commands
+                                 if "nmap" in r.command and r.useful)
+            fp = research.fingerprint_for_port(port, nmap_out)
+            if not fp.version and not fp.product:
+                bcmd = f"nmap -Pn -sV -p{port} {session.target}"
+                cprint("yellow", f"  No fingerprint for port {port} yet — grab a banner?")
+                approval = approve(bcmd)
+                if approval is not False:
+                    cmd_to_run = approval if isinstance(approval, str) else bcmd
+                    cprint("dim", f"  Running: {cmd_to_run}")
+                    code, out = guarded_run(cmd_to_run, timeout=120)
+                    if code == 0:
+                        session.commands.append(CommandRecord(
+                            phase=session.phase, command=cmd_to_run, exit_code=code,
+                            output=out, useful=True, note=f"banner grab port {port}"))
+                        fp = research.fingerprint_for_port(port, out)
+            cprint("cyan", f"  Researching {fp.label()} on {session.target} "
+                           f"(online={'yes' if online else 'no'})...")
+            start = len(session.hypotheses) + 1
+            try:
+                hyps = research_engine.investigate(fp, session.target, client=client, start_idx=start)
+            except Exception as exc:
+                cprint("red", f"  Research error: {exc}")
+                continue
+            if not hyps:
+                cprint("dim", "  No hypotheses — no leads for this service "
+                              "(add a knowledge/ module or try --online).")
+                continue
+            for h in hyps:
+                session.hypotheses.append(h.to_dict())
+                print_hypothesis(h)
+            cprint("dim", f"  {len(hyps)} hypotheses recorded — see :hypotheses.")
+            continue
+
+        if user_input == ":hypotheses":
+            if not session.hypotheses:
+                cprint("dim", "  No research hypotheses yet. Use :research <port>.")
+                continue
+            cprint("cyan", f"\n  Research hypotheses ({len(session.hypotheses)}):")
+            for h in session.hypotheses:
+                cprint("yellow", f"  {h.get('id','?')} [{h.get('severity','?')}/"
+                                 f"{h.get('confidence','?')}/{h.get('status','?')}] {h.get('service','')}")
+                if h.get("observation"):
+                    cprint("dim", f"       {h['observation']}")
+            continue
+
         if user_input == ":findings":
             if session.findings:
                 for i, f in enumerate(session.findings, 1):
@@ -2916,7 +3017,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 src = os.path.basename(parts[1].strip())
                 stats = session.merge_from(data, source=src)
                 cprint("green", f"  Imported from {src}:")
-                cprint("green", f"    +{stats['commands']} commands, +{stats['findings']} findings, +{stats['credentials']} credentials")
+                cprint("green", f"    +{stats['commands']} commands, +{stats['findings']} findings, "
+                                f"+{stats['credentials']} credentials, +{stats.get('hypotheses', 0)} hypotheses")
                 cprint("dim", "  Their history now drives the re-test guard — already-done checks will be skipped.")
             except Exception as exc:
                 cprint("red", f"  Import failed: {exc}")
@@ -3089,6 +3191,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default is fail-closed — execution blocked until a scope is configured)")
     p.add_argument("--audit-log", default="audit.log",
                    help="Execution/approval audit trail file (default: audit.log)")
+    p.add_argument("--online", action="store_true",
+                   help="Allow the research engine to query external sources (e.g. NVD). "
+                        "Off by default — research works fully offline from the local knowledge base")
     return p
 
 
@@ -3235,13 +3340,13 @@ def main() -> int:
             stats = session.merge_from(data, source=os.path.basename(imp))
             print(f"[OK] Imported {os.path.basename(imp)}: "
                   f"+{stats['commands']} commands, +{stats['findings']} findings, "
-                  f"+{stats['credentials']} credentials")
+                  f"+{stats['credentials']} credentials, +{stats.get('hypotheses', 0)} hypotheses")
         except Exception as exc:
             print(f"[!] Could not import {imp}: {exc}")
 
     try:
         interactive_loop(client, session, scope, args.report_dir,
-                         parallel=args.parallel, guard=guard)
+                         parallel=args.parallel, guard=guard, online=args.online)
     except KeyboardInterrupt:
         print("\n[*] Interrupted.")
     finally:

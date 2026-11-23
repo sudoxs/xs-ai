@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.8
+   PENTEST AI ORCHESTRATOR  v0.9
    by sudoxs
 ```
 
@@ -30,6 +30,18 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v0.9
+
+Milestone 2 — the **Service Research Engine** (`research.py`): instead of jumping straight to generic enumeration, xs-ai can *research* a discovered service and produce evidence-based, ranked **vulnerability hypotheses**.
+
+- **`:research <port>`** — fingerprints the service (from existing scan output, or a scope-gated banner grab), gathers leads from a local knowledge base (and, with `--online`, NVD), and asks the model to synthesize ranked hypotheses. Falls back to knowledge-base-only hypotheses when no model output is available, so it works with a single local model and fully offline.
+- **Separate confidence and severity** — a critical bug with weak evidence is *low confidence*, never a confirmed finding. Each hypothesis records status (`confirmed` / `strongly_suspected` / `potential_config` / `unverified` / `not_applicable`), evidence, references, CVEs, preconditions, and a *safe* validation plan.
+- **Honest CVE applicability** — a CVE is never reported just because it mentions the same product. The detected version is compared against affected ranges; out-of-range CVEs are dropped and unknown versions stay unverified.
+- **Pluggable, offline-first sources** — `knowledge/*.json` service modules (extensible) plus a best-effort NVD adapter. The source registry is extensible (CISA KEV, GHSA, OWASP, MITRE ATT&CK can be added without touching the engine).
+- **`:hypotheses`** lists what's been recorded; hypotheses persist in sessions, export bundles, and the final report.
+
+Research/planning never execute against a target, so they are not blocked by scope; the only target interaction (an optional banner grab) goes through the scope guard.
 
 ## What's New in v0.8
 
@@ -137,6 +149,7 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--import` | | Merge another operator's handoff bundle at startup (repeatable) |
 | `--allow-any-target` | | Disable fail-closed scope enforcement (lab use only; prints a warning) |
 | `--audit-log` | `audit.log` | Execution/approval audit trail file |
+| `--online` | | Allow the research engine to query external sources (e.g. NVD); off by default (offline KB only) |
 
 ### Role Mapping (Multi-Model)
 
@@ -230,6 +243,8 @@ Once inside the client, you have these commands:
 | `:auto [redo]` | Run auto-enum checks for current phase (use `--parallel` for concurrent batch mode). `redo` re-runs checks already done |
 | `:ports` | Detect open ports and show available service checks |
 | `:svc <port> [redo]` | Service-specific enum for a port (e.g. `:svc 445`); unknown ports → AI-generated dynamic checks. `redo` re-runs completed checks |
+| `:research <port>` | Research a service → ranked, evidence-based vulnerability hypotheses |
+| `:hypotheses` | List recorded research hypotheses |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 
@@ -543,6 +558,12 @@ Generated automatically on `:quit` or manually with `:report`.
 ```
 xs-ai/
 ├── client.py           # Main interactive client (Kali)
+├── research.py         # Service Research Engine (optional; imported if present)
+├── knowledge/          # Extensible per-service research modules (*.json)
+│   ├── http.json
+│   ├── ssh.json
+│   ├── ftp.json
+│   └── redis.json
 ├── host_setup.ps1      # Windows host setup script
 ├── scope.json          # Allowed targets
 ├── project.md          # Auto-generated project memory (AI-readable)

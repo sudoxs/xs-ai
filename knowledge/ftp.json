@@ -1,0 +1,34 @@
+{
+  "service": "ftp",
+  "aliases": ["ftp", "ftps"],
+  "ports": [21],
+  "notes": "FTP research centers on anonymous access, cleartext credentials, and version-specific CVEs (e.g. vsftpd/ProFTPD). Treat anonymous access and credential exposure as distinct states.",
+  "checks": [
+    {
+      "id": "ftp-anonymous",
+      "title": "Anonymous FTP access",
+      "category": "authentication",
+      "severity": "medium",
+      "when": "the server accepts the 'anonymous' login",
+      "validation": "Attempt an anonymous banner/login check once with approval; list only, do not download en masse. Classify as anonymous access, not 'no auth'.",
+      "references": ["https://owasp.org/www-project-web-security-testing-guide/"]
+    },
+    {
+      "id": "ftp-cleartext",
+      "title": "Cleartext credentials in transit",
+      "category": "configuration",
+      "severity": "low",
+      "when": "plain FTP (not FTPS) is in use",
+      "validation": "Note that captured traffic would expose credentials; recommend FTPS. No action against the target required."
+    },
+    {
+      "id": "ftp-writable",
+      "title": "Writable FTP root",
+      "category": "configuration",
+      "severity": "high",
+      "when": "upload is permitted (often combined with a web root)",
+      "validation": "Check write permission non-destructively with approval; a writable web-served directory can lead to RCE."
+    }
+  ],
+  "default_credentials": []
+}

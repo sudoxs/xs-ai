@@ -1,0 +1,33 @@
+{
+  "service": "ssh",
+  "aliases": ["ssh", "openssh"],
+  "ports": [22],
+  "notes": "SSH is rarely exploitable directly; research focuses on auth configuration, exposed key material found elsewhere, and version-specific CVEs. Never run password brute-force.",
+  "checks": [
+    {
+      "id": "ssh-auth-methods",
+      "title": "Permitted authentication methods",
+      "category": "configuration",
+      "severity": "info",
+      "when": "SSH is reachable",
+      "validation": "Enumerate offered auth methods (publickey/password/keyboard-interactive) non-invasively; password auth widens the attack surface."
+    },
+    {
+      "id": "ssh-weak-algos",
+      "title": "Weak or legacy algorithms offered",
+      "category": "configuration",
+      "severity": "low",
+      "when": "server offers deprecated ciphers/KEX/MACs",
+      "validation": "List algorithms (e.g. nmap ssh2-enum-algos) and compare against current hardening guidance."
+    },
+    {
+      "id": "ssh-key-reuse",
+      "title": "Reusable key material discovered elsewhere",
+      "category": "authentication",
+      "severity": "high",
+      "when": "an id_rsa / authorized_keys was found via another service",
+      "validation": "Attempt key-based login once, with approval and within scope."
+    }
+  ],
+  "default_credentials": []
+}

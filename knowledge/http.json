@@ -1,0 +1,47 @@
+{
+  "service": "http",
+  "aliases": ["http", "https", "www", "http-proxy", "http-alt", "ssl/http"],
+  "ports": [80, 443, 8080, 8443, 8000, 8888],
+  "notes": "Web services expose the broadest attack surface. Research management interfaces, exposed VCS metadata, CMS fingerprints, and default credentials for any identified product before generic fuzzing.",
+  "checks": [
+    {
+      "id": "http-admin-exposed",
+      "title": "Administrative / management interface exposed",
+      "category": "attack-surface",
+      "severity": "high",
+      "when": "an admin, manager, or console path responds (e.g. /admin, /manager/html, /console, /wp-admin)",
+      "validation": "Request the admin path once and read the auth behavior; do not attempt logins without approval.",
+      "references": ["https://owasp.org/www-project-web-security-testing-guide/"]
+    },
+    {
+      "id": "http-git-exposure",
+      "title": "Exposed .git directory",
+      "category": "configuration",
+      "severity": "high",
+      "when": "/.git/HEAD or /.git/config is readable",
+      "validation": "Fetch /.git/HEAD; if present, dumping source is possible with git-dumper (approval + scope required).",
+      "references": ["https://owasp.org/www-community/attacks/"]
+    },
+    {
+      "id": "http-missing-auth",
+      "title": "Sensitive functionality without authentication",
+      "category": "authentication",
+      "severity": "high",
+      "when": "a sensitive endpoint returns 200 with no auth challenge",
+      "validation": "Observe response codes/headers for an auth challenge; classify as absent/anonymous/authenticated — do not assume."
+    },
+    {
+      "id": "http-default-creds",
+      "title": "Default credentials on identified web product",
+      "category": "authentication",
+      "severity": "high",
+      "when": "a product with documented default credentials is fingerprinted",
+      "validation": "Try the single vendor-documented default ONCE with approval and within scope. No brute-force, no wordlists."
+    }
+  ],
+  "default_credentials": [
+    {"product": "Apache Tomcat Manager", "user": "tomcat", "pass": "tomcat", "ref": "https://tomcat.apache.org/"},
+    {"product": "Jenkins (setup)", "user": "admin", "pass": "admin", "ref": "https://www.jenkins.io/doc/"},
+    {"product": "phpMyAdmin", "user": "root", "pass": "", "ref": "https://www.phpmyadmin.net/"}
+  ]
+}
