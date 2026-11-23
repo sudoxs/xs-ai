@@ -18,6 +18,7 @@ import argparse
 import datetime
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -64,7 +65,16 @@ PARALLEL_WORKERS = 3           # max concurrent checks in parallel auto-enum
 
 PHASES = ["recon", "enum", "access", "privesc", "report"]
 
-AI_ROLES = ["planner", "analyzer", "recon", "enum", "access", "privesc", "reporter"]
+# Logical AI roles — capabilities, not necessarily separate models. One model
+# can fill many; users with several models can map different models per role.
+# The research roles (lead_researcher ... report_analyst) back the Research
+# Engine milestone; they resolve through the same RoleMap as the phase roles.
+AI_ROLES = [
+    "planner", "analyzer", "recon", "enum", "access", "privesc", "reporter",
+    # research roles
+    "lead_researcher", "recon_analyst", "service_researcher", "web_researcher",
+    "vuln_analyst", "attack_chain_analyst", "validation_analyst", "report_analyst",
+]
 
 DEFAULT_ROLE_CHAIN: dict[str, str] = {
     "recon": "planner",
@@ -72,6 +82,16 @@ DEFAULT_ROLE_CHAIN: dict[str, str] = {
     "access": "analyzer",
     "privesc": "analyzer",
     "report": "reporter",
+    # research roles fall back to the nearest existing capability so a
+    # single-model setup keeps working with no extra configuration
+    "lead_researcher": "planner",
+    "recon_analyst": "planner",
+    "service_researcher": "analyzer",
+    "web_researcher": "analyzer",
+    "vuln_analyst": "analyzer",
+    "attack_chain_analyst": "analyzer",
+    "validation_analyst": "analyzer",
+    "report_analyst": "reporter",
 }
 
 BANNER = r"""
@@ -81,7 +101,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.7
+   PENTEST AI ORCHESTRATOR  v0.8
    by sudoxs
 """
 
@@ -990,6 +1010,128 @@ def load_scope(path: str) -> set[str]:
         data = json.load(f)
     targets = data.get("allowed_targets", [])
     return {t.strip() for t in targets if isinstance(t, str)}
+
+
+# ---------------------------------------------------------------------------
+# Scope enforcement — centralized, fail-closed target authorization
+#
+# Every route that touches a target (auto-enum, parallel, service checks,
+# :scan/:run/:rrun, AI-suggested commands) is validated through one ScopeGuard
+# so authorization never depends on the model "remembering" the scope. A
+# missing/invalid scope fails CLOSED: execution is refused until the operator
+# configures authorized targets or explicitly opts out with --allow-any-target.
+# Research and planning (no target interaction) are never blocked.
+# ---------------------------------------------------------------------------
+
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+@dataclass
+class ScopeGuard:
+    allowed: list[str] = field(default_factory=list)   # raw entries (IPs, CIDRs, hostnames)
+    configured: bool = False                           # a valid scope source was provided
+    allow_any: bool = False                            # explicit --allow-any-target opt-out
+    audit_path: str = "audit.log"
+
+    def _nets(self) -> list:
+        nets = []
+        for entry in self.allowed:
+            try:
+                nets.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                pass  # hostname, matched literally elsewhere
+        return nets
+
+    def _host_matches(self, target: str) -> bool:
+        t = target.strip()
+        if not t:
+            return False
+        if t in self.allowed:
+            return True
+        try:
+            ip = ipaddress.ip_address(t)
+            return any(ip in net for net in self._nets())
+        except ValueError:
+            return False  # hostname that wasn't an exact allowed entry
+
+    def add(self, target: str) -> None:
+        t = target.strip()
+        if t and t not in self.allowed:
+            self.allowed.append(t)
+            self.configured = True
+
+    def check(self, target: str) -> tuple[bool, str]:
+        """Authorize a single target address/hostname."""
+        if self.allow_any:
+            return True, "scope enforcement disabled (--allow-any-target)"
+        if not self.configured:
+            return False, ("no authorized scope configured — execution blocked "
+                           "(add targets with :scope add <t>, a scope.json, or --allow-any-target)")
+        if self._host_matches(target):
+            return True, "in scope"
+        return False, f"{target} is not in the authorized scope"
+
+    def check_command(self, command: str, session_target: str) -> tuple[bool, str]:
+        """Authorize an execution: the session target AND every IPv4 literal in
+        the command must be in scope (stops an AI/typed command from reaching an
+        out-of-scope host)."""
+        ok, reason = self.check(session_target)
+        if not ok:
+            return ok, reason
+        if self.allow_any:
+            return True, reason
+        for ip in set(_IPV4_RE.findall(command)):
+            if ip in ("127.0.0.1", "0.0.0.0"):
+                continue
+            if not self._host_matches(ip):
+                return False, f"command references out-of-scope host {ip}"
+        return True, "in scope"
+
+    def check_free_command(self, command: str) -> tuple[bool, str]:
+        """For local utility commands not bound to the session target: allow
+        unless the command names an out-of-scope host (fail-closed per IP)."""
+        if self.allow_any:
+            return True, "scope enforcement disabled"
+        for ip in set(_IPV4_RE.findall(command)):
+            if ip in ("127.0.0.1", "0.0.0.0"):
+                continue
+            if not self.configured or not self._host_matches(ip):
+                return False, f"command references out-of-scope host {ip}"
+        return True, "ok"
+
+    def audit(self, event: str, target: str, command: str, extra: str = "") -> None:
+        """Append an execution/approval event to the audit trail (never fatal)."""
+        try:
+            rec = {
+                "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+                "event": event, "target": target, "command": command,
+            }
+            if extra:
+                rec["detail"] = extra
+            with open(self.audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def status(self) -> str:
+        if self.allow_any:
+            return "DISABLED (--allow-any-target) — all targets permitted"
+        if not self.configured:
+            return "FAIL-CLOSED — no authorized targets; execution blocked"
+        return f"active — {len(self.allowed)} entr{'y' if len(self.allowed)==1 else 'ies'}: {', '.join(self.allowed)}"
+
+
+def build_scope_guard(scope_path: str, allow_any: bool, cli_target: str = "",
+                      audit_path: str = "audit.log") -> ScopeGuard:
+    guard = ScopeGuard(allow_any=allow_any, audit_path=audit_path)
+    entries = load_scope(scope_path)
+    for e in entries:
+        guard.add(e)
+    # an explicitly named --target is itself operator authorization for that host
+    if cli_target:
+        guard.add(cli_target)
+    guard.configured = bool(guard.allowed)
+    return guard
 
 
 # ---------------------------------------------------------------------------
@@ -2222,6 +2364,7 @@ def show_help():
       :cheat <file>       Load additional cheat sheet
       :auto [redo]        Run auto-enum; 'redo' re-runs checks already done
       :svc <port> [redo]  Service enum; 'redo' re-runs checks already done
+      :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
       :help               Show this help
       :quit               Exit
@@ -2268,11 +2411,14 @@ def show_status(session: Session):
 
 
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
-                     report_dir: str, parallel: bool = False):
+                     report_dir: str, parallel: bool = False,
+                     guard: ScopeGuard | None = None):
+    guard = guard or ScopeGuard(allow_any=True)  # back-compat if not supplied
     cprint("cyan", BANNER)
     cprint("green", f"  Connected to: {client.base_url}")
     cprint("green", f"  Target: {session.target}")
     cprint("green", f"  Phase: {session.phase}")
+    cprint("green", f"  Scope: {guard.status()}")
     if session.cheatsheet_context:
         cprint("green", f"  Cheat sheet loaded ({len(session.cheatsheet_context)} chars)")
     if session.commands:
@@ -2282,9 +2428,26 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
     ssh_key_file: str | None = None
 
     def execute_cmd(cmd: str) -> tuple[int, str]:
+        # central scope chokepoint — every auto/parallel/single-command route
+        # flows through here, so nothing reaches a target without authorization
+        ok, reason = guard.check_command(cmd, session.target)
+        if not ok:
+            guard.audit("blocked", session.target, cmd, reason)
+            cprint("red", f"  [BLOCKED] {reason}")
+            return 126, f"[BLOCKED] {reason}"
+        guard.audit("execute", session.target, cmd, "remote" if session.ssh else "local")
         if session.ssh:
             return session.ssh.run(cmd)
         return run_command(cmd)
+
+    def guarded_run(cmd: str, timeout: int = CMD_TIMEOUT) -> tuple[int, str]:
+        ok, reason = guard.check_command(cmd, session.target)
+        if not ok:
+            guard.audit("blocked", session.target, cmd, reason)
+            cprint("red", f"  [BLOCKED] {reason}")
+            return 126, f"[BLOCKED] {reason}"
+        guard.audit("execute", session.target, cmd, "local")
+        return run_command(cmd, timeout=timeout)
 
     while True:
         label = session.phase
@@ -2349,11 +2512,33 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             parts = user_input.split(maxsplit=1)
             if len(parts) == 2:
                 new_target = parts[1].strip()
-                if scope and new_target not in scope:
-                    cprint("red", f"  {new_target} is not in scope!")
+                session.target = new_target
+                ok, reason = guard.check(new_target)
+                if ok:
+                    cprint("green", f"  Target -> {session.target} (in scope)")
                 else:
-                    session.target = new_target
-                    cprint("green", f"  Target -> {session.target}")
+                    cprint("yellow", f"  Target -> {session.target}")
+                    cprint("magenta", f"  ⚠ {reason}")
+                    cprint("dim", f"    Authorize with: :scope add {new_target}")
+            continue
+
+        if user_input.startswith(":scope"):
+            parts = user_input.split()
+            if len(parts) == 1 or parts[1] == "show":
+                cprint("cyan", f"  Scope: {guard.status()}")
+                cprint("dim", f"  Audit trail: {guard.audit_path}")
+            elif parts[1] == "add" and len(parts) >= 3:
+                for t in parts[2:]:
+                    guard.add(t)
+                    guard.audit("scope_add", t, "", "operator added target to scope")
+                cprint("green", f"  Added to scope. Now: {guard.status()}")
+            elif parts[1] == "clear":
+                guard.allowed.clear()
+                guard.configured = False
+                guard.audit("scope_clear", "", "", "operator cleared scope")
+                cprint("yellow", "  Scope cleared — execution is now blocked (fail-closed).")
+            else:
+                cprint("dim", "  Usage: :scope [show] | :scope add <target...> | :scope clear")
             continue
 
         if user_input.startswith(":ssh-key"):
@@ -2391,12 +2576,19 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("red", "  Username required.")
                 continue
 
+            ok_scope, reason = guard.check(ssh_host)
+            if not ok_scope:
+                guard.audit("blocked", ssh_host, "ssh connect", reason)
+                cprint("red", f"  [BLOCKED] {reason}")
+                cprint("dim", f"    Authorize with: :scope add {ssh_host}")
+                continue
             cprint("dim", f"  Connecting SSH to {ssh_user}@{ssh_host}:{ssh_port}...")
             conn = SSHConnection(
                 host=ssh_host, port=ssh_port, username=ssh_user,
                 key_file=ssh_key_file,
                 password=session.credentials.get("password"),
             )
+            guard.audit("ssh_connect", ssh_host, f"{ssh_user}@{ssh_host}:{ssh_port}")
             ok, info = conn.connect()
             if ok:
                 session.ssh = conn
@@ -2423,6 +2615,12 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         if user_input.startswith(":run "):
             cmd = user_input[5:].strip()
             if cmd:
+                ok, reason = guard.check_free_command(cmd)
+                if not ok:
+                    guard.audit("blocked", session.target, cmd, reason)
+                    cprint("red", f"  [BLOCKED] {reason}")
+                    continue
+                guard.audit("execute", session.target, cmd, "local :run")
                 code, output = run_command(cmd)
                 print(output)
                 rec = CommandRecord(
@@ -2439,6 +2637,12 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("red", "  No SSH connection. Use :ssh first.")
                 continue
             if cmd:
+                ok, reason = guard.check(session.ssh.host)
+                if not ok:
+                    guard.audit("blocked", session.ssh.host, cmd, reason)
+                    cprint("red", f"  [BLOCKED] {reason}")
+                    continue
+                guard.audit("execute", session.ssh.host, cmd, "remote :rrun")
                 cprint("dim", f"  Running on {session.ssh.label}: {cmd}")
                 code, output = session.ssh.run(cmd)
                 print(output)
@@ -2458,7 +2662,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             if approval is not False:
                 cmd_to_run = approval if isinstance(approval, str) else cmd
                 cprint("dim", f"  Running: {cmd_to_run}")
-                code, output = run_command(cmd_to_run, timeout=180)
+                code, output = guarded_run(cmd_to_run, timeout=180)
                 is_useful = code == 0 and len(output.strip()) > 10
                 rec = CommandRecord(
                     phase="recon", command=cmd_to_run,
@@ -2475,7 +2679,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             if approval is not False:
                 cmd_to_run = approval if isinstance(approval, str) else cmd
                 cprint("dim", f"  Running: {cmd_to_run}")
-                code, output = run_command(cmd_to_run, timeout=600)
+                code, output = guarded_run(cmd_to_run, timeout=600)
                 is_useful = code == 0 and len(output.strip()) > 10
                 rec = CommandRecord(
                     phase="recon", command=cmd_to_run,
@@ -2507,7 +2711,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     continue
                 bcmd_run = approval if isinstance(approval, str) else bcmd
                 cprint("dim", f"  Running: {bcmd_run}")
-                code, banner = run_command(bcmd_run, timeout=120)
+                code, banner = guarded_run(bcmd_run, timeout=120)
                 session.commands.append(CommandRecord(
                     phase=session.phase, command=bcmd_run, exit_code=code,
                     output=banner, useful=(code == 0 and bool(banner.strip())),
@@ -2527,7 +2731,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         if user_input == ":ports":
             cprint("dim", "  Scanning for open ports...")
-            code, output = run_command(
+            code, output = guarded_run(
                 f"nmap -Pn --top-ports 200 -T4 --open {session.target}",
                 timeout=120,
             )
@@ -2880,6 +3084,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--import", dest="import_file", action="append", default=[],
                    metavar="FILE",
                    help="Merge another operator's handoff bundle at startup (repeatable)")
+    p.add_argument("--allow-any-target", action="store_true",
+                   help="DANGER: disable scope enforcement and permit any target "
+                        "(default is fail-closed — execution blocked until a scope is configured)")
+    p.add_argument("--audit-log", default="audit.log",
+                   help="Execution/approval audit trail file (default: audit.log)")
     return p
 
 
@@ -2954,11 +3163,17 @@ def main() -> int:
             print(f"       Make sure host_setup.ps1 has been run on {args.host}")
         return 1
 
-    scope = load_scope(args.scope)
-    if scope:
-        print(f"[OK] Scope loaded: {', '.join(sorted(scope))}")
+    guard = build_scope_guard(args.scope, args.allow_any_target,
+                              cli_target=args.target or "", audit_path=args.audit_log)
+    scope = set(guard.allowed)  # kept for backward-compat with existing checks
+    if args.allow_any_target:
+        print("[!] DANGER: --allow-any-target — scope enforcement DISABLED; any target permitted.")
+    elif guard.configured:
+        print(f"[OK] Scope: {guard.status()}")
     else:
-        print(f"[!] No scope file found ({args.scope}). Scope checking disabled.")
+        print(f"[!] No authorized scope ({args.scope}). FAIL-CLOSED: execution is blocked")
+        print("    until you configure targets (scope.json, --target, :scope add, or --allow-any-target).")
+        print("    Research and planning still work without executing commands.")
 
     # Load cheat sheets
     cheat_paths = args.cheatsheet or []
@@ -2999,9 +3214,11 @@ def main() -> int:
             print("[FAIL] No target specified.")
             return 1
 
-        if scope and target not in scope:
-            print(f"[FAIL] {target} is not in scope!")
-            return 1
+        ok_scope, reason = guard.check(target)
+        if not ok_scope:
+            print(f"[!] {reason}")
+            print(f"    Execution against {target} is blocked until authorized "
+                  f"(:scope add {target} in-session, or --allow-any-target).")
 
         session = Session(
             target=target,
@@ -3023,7 +3240,8 @@ def main() -> int:
             print(f"[!] Could not import {imp}: {exc}")
 
     try:
-        interactive_loop(client, session, scope, args.report_dir, parallel=args.parallel)
+        interactive_loop(client, session, scope, args.report_dir,
+                         parallel=args.parallel, guard=guard)
     except KeyboardInterrupt:
         print("\n[*] Interrupted.")
     finally:

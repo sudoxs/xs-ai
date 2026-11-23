@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.7
+   PENTEST AI ORCHESTRATOR  v0.8
    by sudoxs
 ```
 
@@ -30,6 +30,17 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v0.8
+
+Milestone 1 of the Red-Team-Researcher roadmap — security foundation:
+
+- **Centralized, fail-closed scope enforcement** — one `ScopeGuard` validates every target-touching route (CIDR / IP / hostname aware), and blocks commands that embed any out-of-scope IP. No scope configured ⇒ execution blocked (planning still works). Opt out explicitly with `--allow-any-target`. See *Scope File & Fail-Closed Enforcement*.
+- **Execution audit trail** — every execute / block / approval / scope change is logged as JSON lines to `audit.log` (`--audit-log`).
+- **Runtime scope control** — `:scope show | add <t> | clear`.
+- **Extended role vocabulary** — model-agnostic research roles (`lead_researcher`, `recon_analyst`, `service_researcher`, `web_researcher`, `vuln_analyst`, `attack_chain_analyst`, `validation_analyst`, `report_analyst`) assignable via `:roles`/`--role`, each falling back to an existing capability so single-model setups keep working.
+
+Remaining milestones (not yet implemented): Service Research Engine, vulnerability hypotheses with evidence/confidence, attack-chain analysis, dynamic multi-model provider registry, secure remote-access modes, and a benchmark framework.
 
 ## What's New in v0.7
 
@@ -124,6 +135,8 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--no-structured` | | Disable schema-constrained JSON responses; use the legacy `CMD:` text protocol |
 | `--parallel` | | Run auto-enum checks concurrently after one batch approval |
 | `--import` | | Merge another operator's handoff bundle at startup (repeatable) |
+| `--allow-any-target` | | Disable fail-closed scope enforcement (lab use only; prints a warning) |
+| `--audit-log` | `audit.log` | Execution/approval audit trail file |
 
 ### Role Mapping (Multi-Model)
 
@@ -190,6 +203,7 @@ Once inside the client, you have these commands:
 | `<text>` | Talk to the AI — describe what you want |
 | `:phase <name>` | Switch phase: `recon`, `enum`, `access`, `privesc`, `report` |
 | `:target <ip>` | Change target IP |
+| `:scope [show\|add <t>\|clear]` | Show or modify the authorized target scope |
 | `:os linux\|windows` | Set target OS (affects auto-enum and tool suggestions) |
 | `:cred <user> [pass]` | Set credentials (password prompted if omitted) |
 | `:status` | Show current session status |
@@ -442,20 +456,30 @@ Run `:install` to check which tools are available on your Kali system. xs-ai che
     whatweb installed OK
 ```
 
-## Scope File
+## Scope File & Fail-Closed Enforcement
 
-`scope.json` restricts which targets can be used:
+`scope.json` lists the targets you are authorized to test. Entries may be exact IPs, **CIDR ranges**, or hostnames:
 
 ```json
 {
   "allowed_targets": [
-    "10.10.110.123",
-    "10.10.110.124"
+    "10.10.110.0/24",
+    "192.168.1.50",
+    "box.htb"
   ]
 }
 ```
 
-If a target is not in scope, xs-ai refuses to scan it.
+**Scope enforcement is centralized and fail-closed (v0.8+).** Every route that touches a target — auto-enum, parallel checks, service checks, `:scan`/`:fullscan`/`:ports`/`:svc`, `:run`/`:rrun`, SSH connect, and AI-suggested commands — is validated through one `ScopeGuard`. Authorization never depends on the model "remembering" the scope. A command is also blocked if it embeds *any* out-of-scope IP, so an AI suggestion can't reach a host you didn't authorize.
+
+If no scope is configured, **execution is blocked** (research and planning still work). Authorize targets in any of these ways:
+
+- a `scope.json` file (default path, or `--scope <file>`),
+- `--target <ip>` on the command line (naming a target authorizes that one host),
+- `:scope add <target>` at runtime (`:scope show` / `:scope clear` too),
+- `--allow-any-target` to disable enforcement entirely (prints a loud warning — lab use only).
+
+Every execution, block, approval, and scope change is written to an **audit trail** (`audit.log` by default, or `--audit-log <file>`) as JSON lines.
 
 ## Session Save/Load
 
