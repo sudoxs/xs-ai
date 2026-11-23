@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -105,7 +106,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.9
+   PENTEST AI ORCHESTRATOR  v1.0
    by sudoxs
 """
 
@@ -2404,6 +2405,7 @@ def show_help():
       :svc <port> [redo]  Service enum; 'redo' re-runs checks already done
       :research <port>    Research a service → ranked vulnerability hypotheses
       :hypotheses         List recorded research hypotheses
+      :validate <id>      Safely validate one hypothesis (approval + attempt-limited)
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
       :help               Show this help
@@ -2452,8 +2454,10 @@ def show_status(session: Session):
 
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
                      report_dir: str, parallel: bool = False,
-                     guard: ScopeGuard | None = None, online: bool = False):
+                     guard: ScopeGuard | None = None, online: bool = False,
+                     cred_attempts: int = 3, cred_delay: float = 0.0):
     guard = guard or ScopeGuard(allow_any=True)  # back-compat if not supplied
+    cred_used: dict[str, int] = {}  # hypothesis id -> validation attempts used
     research_engine = None
     if research is not None:
         research_engine = research.ResearchEngine(
@@ -2939,6 +2943,60 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             cprint("dim", f"  {len(hyps)} hypotheses recorded — see :hypotheses.")
             continue
 
+        if user_input.startswith(":validate"):
+            if research is None:
+                cprint("red", "  Research engine unavailable (research.py not found).")
+                continue
+            tokens = user_input.split()
+            if len(tokens) < 2:
+                cprint("red", "  Usage: :validate <hypothesis-id>  (e.g. :validate H001)")
+                continue
+            hid = tokens[1].strip().upper()
+            hyp = next((h for h in session.hypotheses if h.get("id", "").upper() == hid), None)
+            if not hyp:
+                cprint("red", f"  No hypothesis {hid}. Use :hypotheses to list them.")
+                continue
+            cmd, kind = research.build_validation(hyp, session.target)
+            if cmd is None:
+                cprint("yellow", f"  {kind}")
+                continue
+            used = cred_used.get(hid, 0)
+            if used >= cred_attempts:
+                cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}). "
+                              f"Stopping — no brute-force.")
+                continue
+            svc = (hyp.get("validation_hint", {}) or {}).get("service", "")
+            cprint("cyan", f"  Validation for {hid} ({kind}) — single non-invasive check, "
+                           f"attempt {used + 1}/{cred_attempts}")
+            approval = approve(cmd)  # operator approval + (via guarded_run) scope check
+            if approval is False:
+                cprint("dim", "  Skipped.")
+                continue
+            cmd_to_run = approval if isinstance(approval, str) else cmd
+            if cred_delay and used > 0:
+                time.sleep(cred_delay)
+            code, output = guarded_run(cmd_to_run, timeout=60)
+            if output.startswith("[BLOCKED]"):
+                continue  # scope guard already reported + audited
+            cred_used[hid] = used + 1
+            guard.audit("validate", session.target, cmd_to_run, f"hypothesis {hid}")
+            status, conf, auth_state, note = research.classify_validation(kind, svc, code, output)
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            hyp["status"] = status
+            hyp["confidence"] = conf
+            hyp["auth_state"] = auth_state
+            hyp.setdefault("evidence", []).append(f"[validate {ts}] {note} (exit {code})")
+            if output.strip():
+                print("  " + output.strip()[:300].replace("\n", "\n  "))
+            cprint("green", f"  -> {note}")
+            cprint("dim", f"     status={status} confidence={conf} auth_state={auth_state}")
+            if status == research.STATUS_CONFIRMED:
+                finding = f"[{hid}] VALIDATED: {note} ({hyp.get('service','')})"
+                if finding not in session.findings:
+                    session.findings.append(finding)
+                    cprint("green", f"  FINDING: {finding}")
+            continue
+
         if user_input == ":hypotheses":
             if not session.hypotheses:
                 cprint("dim", "  No research hypotheses yet. Use :research <port>.")
@@ -3194,6 +3252,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--online", action="store_true",
                    help="Allow the research engine to query external sources (e.g. NVD). "
                         "Off by default — research works fully offline from the local knowledge base")
+    p.add_argument("--cred-attempts", type=int, default=3,
+                   help="Max validation attempts per hypothesis (no brute-force; default 3)")
+    p.add_argument("--cred-delay", type=float, default=0.0,
+                   help="Seconds to wait between validation attempts (default 0)")
     return p
 
 
@@ -3346,7 +3408,8 @@ def main() -> int:
 
     try:
         interactive_loop(client, session, scope, args.report_dir,
-                         parallel=args.parallel, guard=guard, online=args.online)
+                         parallel=args.parallel, guard=guard, online=args.online,
+                         cred_attempts=args.cred_attempts, cred_delay=args.cred_delay)
     except KeyboardInterrupt:
         print("\n[*] Interrupted.")
     finally:

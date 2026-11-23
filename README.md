@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v0.9
+   PENTEST AI ORCHESTRATOR  v1.0
    by sudoxs
 ```
 
@@ -30,6 +30,14 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.0
+
+Milestone 3 — **authentication assessment & safe credential validation**:
+
+- **Five distinct authentication states**, never conflated: *no authentication*, *anonymous access accepted*, *default credential possible (documented, untested)*, *credential validated (actually accepted here)*, *unknown*.
+- **`:validate <hypothesis-id>`** — safely validates a single hypothesis. Strict controls (no brute-force, ever): one documented credential or one anonymous/no-auth probe; operator approval required; scope-checked; **attempt-limited** (`--cred-attempts`, default 3) with an optional delay (`--cred-delay`); every attempt recorded as evidence on the hypothesis and in the audit trail. Services without a safe automated probe (e.g. SSH) are left for manual validation.
+- **Evidence-driven status updates** — a successful probe promotes a hypothesis to `confirmed` (high confidence) and records the auth state (e.g. anonymous access); a rejection marks it `not_applicable`. A documented-default-credential hypothesis stays *possible* until actually validated.
 
 ## What's New in v0.9
 
@@ -150,6 +158,8 @@ python3 client.py --host 192.168.198.1 --os-type linux --phase privesc
 | `--allow-any-target` | | Disable fail-closed scope enforcement (lab use only; prints a warning) |
 | `--audit-log` | `audit.log` | Execution/approval audit trail file |
 | `--online` | | Allow the research engine to query external sources (e.g. NVD); off by default (offline KB only) |
+| `--cred-attempts` | `3` | Max validation attempts per hypothesis (no brute-force) |
+| `--cred-delay` | `0` | Seconds between validation attempts |
 
 ### Role Mapping (Multi-Model)
 
@@ -245,6 +255,7 @@ Once inside the client, you have these commands:
 | `:svc <port> [redo]` | Service-specific enum for a port (e.g. `:svc 445`); unknown ports → AI-generated dynamic checks. `redo` re-runs completed checks |
 | `:research <port>` | Research a service → ranked, evidence-based vulnerability hypotheses |
 | `:hypotheses` | List recorded research hypotheses |
+| `:validate <id>` | Safely validate one hypothesis (approval + scope + attempt-limited, no brute-force) |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 

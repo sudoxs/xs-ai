@@ -45,6 +45,16 @@ STATUS_ORDER = {
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 CONFIDENCE_ORDER = {"high": 3, "medium": 2, "low": 1}
 
+# Authentication posture — the FIVE distinct states from the spec. These must
+# never be confused: "anonymous access accepted" is not "no authentication",
+# and "a default credential may exist" is not "a credential was validated".
+AUTH_NONE = "no_authentication"            # service exposes functions with no auth at all
+AUTH_ANONYMOUS = "anonymous_access"        # an anonymous/guest login is accepted
+AUTH_DEFAULT_POSSIBLE = "default_credential_possible"  # vendor default documented, untested
+AUTH_VALIDATED = "credential_validated"    # a credential was actually accepted here
+AUTH_UNKNOWN = "unknown"                   # behavior not determined
+AUTH_STATES = {AUTH_NONE, AUTH_ANONYMOUS, AUTH_DEFAULT_POSSIBLE, AUTH_VALIDATED, AUTH_UNKNOWN}
+
 
 def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
@@ -204,6 +214,8 @@ class Hypothesis:
     status: str = STATUS_UNVERIFIED
     conclusion: str = ""
     category: str = ""         # authentication / configuration / cve / attack-surface
+    auth_state: str = ""       # one of AUTH_* once an auth posture is assessed
+    validation_hint: dict = field(default_factory=dict)  # how :validate can check this
     created_at: str = field(default_factory=_now)
 
     def rank_key(self) -> tuple:
@@ -221,7 +233,8 @@ class Hypothesis:
             "preconditions": self.preconditions, "validation_plan": self.validation_plan,
             "severity": self.severity, "confidence": self.confidence,
             "status": self.status, "conclusion": self.conclusion,
-            "category": self.category, "created_at": self.created_at,
+            "category": self.category, "auth_state": self.auth_state,
+            "validation_hint": self.validation_hint, "created_at": self.created_at,
         }
 
     @classmethod
@@ -234,7 +247,9 @@ class Hypothesis:
             validation_plan=d.get("validation_plan", ""),
             severity=d.get("severity", "info"), confidence=d.get("confidence", "low"),
             status=d.get("status", STATUS_UNVERIFIED), conclusion=d.get("conclusion", ""),
-            category=d.get("category", ""), created_at=d.get("created_at", _now()),
+            category=d.get("category", ""), auth_state=d.get("auth_state", ""),
+            validation_hint=dict(d.get("validation_hint", {})),
+            created_at=d.get("created_at", _now()),
         )
 
 
@@ -486,6 +501,9 @@ class ResearchEngine:
             if "status" not in lead:
                 status = (STATUS_POTENTIAL_CONFIG if lead.get("category") == "configuration"
                           else STATUS_UNVERIFIED)
+            vhint = {"service": fp.service, "port": fp.port}
+            if lead.get("default_credential"):
+                vhint["default_credential"] = lead["default_credential"]
             out.append(Hypothesis(
                 id=f"H{i:03d}", asset=asset, service=fp.label(),
                 observation=lead.get("observation") or lead.get("title", ""),
@@ -496,6 +514,7 @@ class ResearchEngine:
                 severity=_normalize_severity(lead.get("severity", "info")),
                 confidence=_normalize_confidence(lead.get("confidence", "low")),
                 status=status, category=lead.get("category", ""),
+                validation_hint=vhint,
             ))
         return out
 
@@ -533,10 +552,20 @@ class ResearchEngine:
         if not obj or not isinstance(obj.get("hypotheses"), list):
             return sorted(baseline, key=lambda h: h.rank_key(), reverse=True)
 
+        # a documented default credential for this service, so AI-generated auth
+        # hypotheses are still validatable through the safe :validate workflow
+        kb = next((s for s in self.sources if isinstance(s, LocalKnowledgeBase)), None)
+        mod = kb.module_for(fp) if kb else None
+        default_cred = (mod.get("default_credentials") or [None])[0] if mod else None
+
         out: list[Hypothesis] = []
         for i, h in enumerate(obj["hypotheses"], start=start_idx):
             if not isinstance(h, dict):
                 continue
+            category = str(h.get("category", "")).strip()
+            vhint = {"service": fp.service, "port": fp.port}
+            if category == "authentication" and default_cred:
+                vhint["default_credential"] = default_cred
             out.append(Hypothesis(
                 id=f"H{i:03d}", asset=asset, service=fp.label(),
                 observation=str(h.get("observation", "")).strip(),
@@ -550,11 +579,92 @@ class ResearchEngine:
                 confidence=_normalize_confidence(h.get("confidence", "low")),
                 status=_normalize_status(h.get("status", STATUS_UNVERIFIED)),
                 conclusion=str(h.get("conclusion", "")).strip(),
-                category=str(h.get("category", "")).strip(),
+                category=category, validation_hint=vhint,
             ))
         if not out:
             return sorted(baseline, key=lambda h: h.rank_key(), reverse=True)
         return sorted(out, key=lambda h: h.rank_key(), reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Safe credential / authentication validation
+#
+# Strict controls (spec §5): single documented credential or a single
+# anonymous/no-auth probe only. NO wordlists, NO brute-force. Every attempt is
+# approved by the operator, scope-checked, attempt-limited, and recorded. The
+# builder returns ONE non-invasive command, or None when a hypothesis has no
+# safe automated check (then the operator validates manually).
+# ---------------------------------------------------------------------------
+
+def build_validation(hyp: dict, target: str) -> tuple[str | None, str]:
+    vh = hyp.get("validation_hint", {}) or {}
+    svc = (vh.get("service") or "").lower()
+    port = str(vh.get("port") or "").strip()
+    cred = vh.get("default_credential")
+    text = (hyp.get("observation", "") + " " + hyp.get("category", "")).lower()
+
+    if svc == "redis":
+        p = port or "6379"
+        return (f"redis-cli -h {target} -p {p} --no-auth-warning INFO server", "anon-check")
+    if svc == "ftp":
+        p = port or "21"
+        return (f"nmap -Pn -p{p} --script ftp-anon {target}", "anon-check")
+    if svc in ("http", "https", "www", "http-proxy", "http-alt") and cred:
+        proto = "https" if port in ("443", "8443") else "http"
+        p = port or ("443" if proto == "https" else "80")
+        u, pw = cred.get("user", ""), cred.get("pass", "")
+        return (f"curl -s -k -o /dev/null -w '%{{http_code}}' "
+                f"-u {shlex_quote(u)}:{shlex_quote(pw)} {proto}://{target}:{p}/", "default-cred")
+    if "anonymous" in text or "no_authentication" in text or "no auth" in text:
+        # generic: fall back to manual
+        return (None, "no safe automated probe for this service — validate manually")
+    return (None, "this hypothesis has no safe automated validation — validate manually")
+
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s or "")
+
+
+def classify_validation(kind: str, service: str, exit_code: int,
+                        output: str) -> tuple[str, str, str, str]:
+    """Map a validation command's result to (status, confidence, auth_state, note).
+    Conservative: only a clearly successful probe confirms; failures are recorded
+    but do not over-claim."""
+    svc = (service or "").lower()
+    out = (output or "").lower()
+
+    if kind == "anon-check" and svc == "redis":
+        if "noauth" in out or "authentication required" in out or "auth " in out:
+            return (STATUS_NOT_APPLICABLE, "high", AUTH_UNKNOWN,
+                    "Redis requires AUTH — not anonymous")
+        if exit_code == 0 and ("redis_version" in out or "# server" in out or "uptime" in out):
+            return (STATUS_CONFIRMED, "high", AUTH_ANONYMOUS,
+                    "unauthenticated INFO succeeded — anonymous access confirmed")
+        return (STATUS_UNVERIFIED, "low", AUTH_UNKNOWN,
+                f"inconclusive Redis probe (exit {exit_code})")
+
+    if kind == "anon-check" and svc == "ftp":
+        if "allowed" in out or "anonymous ftp login allowed" in out or "ftp-anon" in out and "allowed" in out:
+            return (STATUS_CONFIRMED, "high", AUTH_ANONYMOUS,
+                    "anonymous FTP login allowed")
+        if "anonymous" in out and "denied" in out:
+            return (STATUS_NOT_APPLICABLE, "high", AUTH_UNKNOWN, "anonymous FTP denied")
+        return (STATUS_UNVERIFIED, "low", AUTH_UNKNOWN,
+                f"anonymous FTP not confirmed (exit {exit_code})")
+
+    if kind == "default-cred":
+        code = out.strip().strip("'\"")
+        if code in ("200", "301", "302"):
+            return (STATUS_CONFIRMED, "high", AUTH_VALIDATED,
+                    f"default credential accepted (HTTP {code})")
+        if code in ("401", "403"):
+            return (STATUS_NOT_APPLICABLE, "high", AUTH_UNKNOWN,
+                    f"default credential rejected (HTTP {code})")
+        return (STATUS_UNVERIFIED, "low", AUTH_UNKNOWN,
+                f"inconclusive (HTTP {code or '?'}, exit {exit_code})")
+
+    return (STATUS_UNVERIFIED, "low", AUTH_UNKNOWN, f"inconclusive (exit {exit_code})")
 
 
 def _loads_relaxed(text: str) -> dict | None:
