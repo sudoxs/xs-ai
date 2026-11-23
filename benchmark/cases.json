@@ -1,0 +1,157 @@
+{
+  "_comment": "Benchmark fixtures. Each case: {id, category, kind, input, expect, negative?}. Deterministic/offline. 'negative' marks cases where the correct answer is NOT to flag — a failure there is a false positive.",
+  "cases": [
+    {
+      "id": "svc-id-http",
+      "category": "service-identification",
+      "kind": "fingerprint",
+      "input": {"port": 8080, "nmap": "8080/tcp open  http    Apache httpd 2.4.49"},
+      "expect": {"service": "http", "version": "2.4.49", "reliability": "confirmed"}
+    },
+    {
+      "id": "svc-id-ssh",
+      "category": "service-identification",
+      "kind": "fingerprint",
+      "input": {"port": 22, "nmap": "22/tcp open  ssh  OpenSSH 8.2p1 Ubuntu"},
+      "expect": {"service": "ssh", "version": "8.2p1"}
+    },
+    {
+      "id": "cve-in-range",
+      "category": "cve-relevance",
+      "kind": "applicability",
+      "input": {"service": "http", "version": "2.4.49",
+                "affected": {"version_start": "2.4.49", "version_end_including": "2.4.49"}},
+      "expect": {"status": "strongly_suspected", "confidence": "medium"}
+    },
+    {
+      "id": "cve-out-of-range",
+      "category": "cve-relevance",
+      "kind": "applicability",
+      "negative": true,
+      "input": {"service": "http", "version": "2.4.58",
+                "affected": {"version_start": "2.4.49", "version_end_including": "2.4.49"}},
+      "expect": {"status": "not_applicable"}
+    },
+    {
+      "id": "cve-unknown-version",
+      "category": "cve-relevance",
+      "kind": "applicability",
+      "negative": true,
+      "input": {"service": "http", "version": "",
+                "affected": {"version_start": "2.4.0"}},
+      "expect": {"status": "unverified", "confidence": "low"}
+    },
+    {
+      "id": "nvd-drops-inapplicable",
+      "category": "source-quality",
+      "kind": "nvd_parse",
+      "input": {
+        "service": "http", "product": "Apache httpd", "version": "2.4.49",
+        "response": {"vulnerabilities": [
+          {"cve": {"id": "CVE-2021-41773",
+            "descriptions": [{"lang": "en", "value": "Path traversal"}],
+            "metrics": {"cvssMetricV31": [{"cvssData": {"baseSeverity": "CRITICAL"}}]},
+            "configurations": [{"nodes": [{"cpeMatch": [{"versionStartIncluding": "2.4.49", "versionEndIncluding": "2.4.49"}]}]}]}},
+          {"cve": {"id": "CVE-1111-2222",
+            "descriptions": [{"lang": "en", "value": "Only 1.x"}],
+            "configurations": [{"nodes": [{"cpeMatch": [{"versionEndExcluding": "2.0.0"}]}]}]}}
+        ]}
+      },
+      "expect": {"kept_cves": ["CVE-2021-41773"]}
+    },
+    {
+      "id": "default-config-research-http",
+      "category": "default-config-research",
+      "kind": "kb_lookup",
+      "input": {"service": "http", "port": 80},
+      "expect": {"titles": {"__contains__": "default credentials"}, "categories": ["attack-surface", "authentication", "configuration"]}
+    },
+    {
+      "id": "auth-anonymous-redis",
+      "category": "auth-weakness-id",
+      "kind": "classify",
+      "input": {"kind": "anon-check", "service": "redis", "exit_code": 0, "output": "# Server\nredis_version:6.0.16"},
+      "expect": {"status": "confirmed", "auth_state": "anonymous_access", "confidence": "high"}
+    },
+    {
+      "id": "auth-redis-requires-auth",
+      "category": "auth-weakness-id",
+      "kind": "classify",
+      "negative": true,
+      "input": {"kind": "anon-check", "service": "redis", "exit_code": 1, "output": "NOAUTH Authentication required."},
+      "expect": {"status": "not_applicable"}
+    },
+    {
+      "id": "auth-default-cred-accepted",
+      "category": "auth-weakness-id",
+      "kind": "classify",
+      "input": {"kind": "default-cred", "service": "http", "exit_code": 0, "output": "200"},
+      "expect": {"status": "confirmed", "auth_state": "credential_validated"}
+    },
+    {
+      "id": "auth-default-cred-rejected",
+      "category": "false-positive-reduction",
+      "kind": "classify",
+      "negative": true,
+      "input": {"kind": "default-cred", "service": "http", "exit_code": 0, "output": "401"},
+      "expect": {"status": "not_applicable"}
+    },
+    {
+      "id": "hypotheses-redis-critical",
+      "category": "hypothesis-generation",
+      "kind": "hypotheses",
+      "input": {"port": 6379, "asset": "10.0.0.5",
+                "nmap": "6379/tcp open  redis   Redis key-value store 6.0.16"},
+      "expect": {"top_severity": "critical", "well_formed": true}
+    },
+    {
+      "id": "evidence-quality-wellformed",
+      "category": "evidence-quality",
+      "kind": "hypotheses",
+      "input": {"port": 80, "asset": "10.0.0.5",
+                "nmap": "80/tcp open  http   Apache httpd 2.4.49"},
+      "expect": {"well_formed": true, "categories": ["attack-surface", "authentication", "configuration"]}
+    },
+    {
+      "id": "chain-links-access",
+      "category": "attack-chain-reasoning",
+      "kind": "chains",
+      "input": {
+        "asset": "10.0.0.5",
+        "hypotheses": [
+          {"id": "H001", "category": "attack-surface", "status": "strongly_suspected", "observation": "manager exposed"},
+          {"id": "H002", "category": "authentication", "status": "confirmed", "observation": "default creds accepted"},
+          {"id": "H003", "category": "configuration", "status": "potential_config", "observation": "WAR upload enabled"}
+        ]
+      },
+      "expect": {"linked_ids": ["H001", "H002", "H003"]}
+    },
+    {
+      "id": "chain-excludes-not-applicable",
+      "category": "false-positive-reduction",
+      "kind": "chains",
+      "negative": true,
+      "input": {
+        "asset": "10.0.0.5",
+        "hypotheses": [
+          {"id": "H001", "category": "attack-surface", "status": "strongly_suspected", "observation": "iface"},
+          {"id": "H009", "category": "authentication", "status": "not_applicable", "observation": "anon denied"}
+        ]
+      },
+      "expect": {"chain_count": 0}
+    },
+    {
+      "id": "report-sections",
+      "category": "reporting-accuracy",
+      "kind": "report",
+      "input": {
+        "target": "10.0.0.5",
+        "findings": ["[H002] VALIDATED: default creds"],
+        "hypotheses": [{"id": "H002", "service": "http", "severity": "high", "confidence": "high", "status": "confirmed", "observation": "default creds"}],
+        "attack_chains": [{"id": "C001", "title": "access chain", "steps": ["a", "b"], "confidence": "low", "impact": "access"}],
+        "want_sections": ["## Findings", "## Research Hypotheses", "## Attack Chains"]
+      },
+      "expect": {"has_sections": ["## Findings", "## Research Hypotheses", "## Attack Chains"]}
+    }
+  ]
+}

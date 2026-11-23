@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.2
+   PENTEST AI ORCHESTRATOR  v1.3
    by sudoxs
 ```
 
@@ -30,6 +30,16 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.3
+
+Milestone 6 — **benchmark framework** (`benchmark.py`, `benchmark/cases.json`):
+
+- Measures the **quality of the engine's logic**, not how convincing a model sounds. The core suite is deterministic and offline (no model, no network) and runs in CI as a regression gate: `python3 benchmark.py` (non-zero exit on any failure).
+- Covers service identification, CVE-relevance assessment, default-configuration research, authentication-weakness identification, hypothesis generation, attack-chain reasoning, **false-positive reduction**, evidence quality, research-source quality, and report accuracy — with per-category scores and false-positive / false-negative counts.
+- Cases are JSON fixtures (data, not code), so new cases need no runner changes and the suite is provider/model-agnostic. Writing it immediately found and fixed two real issues (OpenSSH `8.2p1` version parsing; an over-eager chain expectation).
+
+This completes the Red-Team-Researcher roadmap (Milestones 1–6).
 
 ## What's New in v1.2
 
@@ -75,7 +85,7 @@ Milestone 1 of the Red-Team-Researcher roadmap — security foundation:
 - **Runtime scope control** — `:scope show | add <t> | clear`.
 - **Extended role vocabulary** — model-agnostic research roles (`lead_researcher`, `recon_analyst`, `service_researcher`, `web_researcher`, `vuln_analyst`, `attack_chain_analyst`, `validation_analyst`, `report_analyst`) assignable via `:roles`/`--role`, each falling back to an existing capability so single-model setups keep working.
 
-Remaining milestones (not yet implemented): Service Research Engine, vulnerability hypotheses with evidence/confidence, attack-chain analysis, dynamic multi-model provider registry, secure remote-access modes, and a benchmark framework.
+(These later shipped in v0.9–v1.3: Service Research Engine, vulnerability hypotheses with evidence/confidence, attack-chain analysis, multi-model registry, secure connection modes, and the benchmark framework.)
 
 ## What's New in v0.7
 
@@ -591,6 +601,8 @@ xs-ai/
 ├── research.py         # Service Research Engine (optional; imported if present)
 ├── providers.py        # Multi-model registry + routing (optional)
 ├── connection.py       # Connection modes + diagnostics (optional)
+├── benchmark.py        # Offline quality benchmark (CI regression gate)
+├── benchmark/cases.json # Benchmark fixtures (data; extensible)
 ├── models.example.json # Copy to models.json to enable multi-model routing
 ├── knowledge/          # Extensible per-service research modules (*.json)
 │   ├── http.json

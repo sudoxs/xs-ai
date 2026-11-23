@@ -108,8 +108,8 @@ def parse_fingerprints(nmap_output: str) -> list[ServiceFingerprint]:
         rest = (m.group("rest") or "").strip()
         product, version = "", ""
         if rest:
-            # last whitespace-separated token that looks like a version
-            vm = re.search(r"(\d+(?:\.\d+){1,3}[a-z]?)", rest)
+            # version token, incl. suffixes like OpenSSH "8.2p1"
+            vm = re.search(r"(\d+(?:\.\d+){1,3}[a-z]?\d*)", rest)
             if vm:
                 version = vm.group(1)
                 product = rest[:vm.start()].strip()
