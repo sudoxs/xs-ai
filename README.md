@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.0
+   PENTEST AI ORCHESTRATOR  v1.1
    by sudoxs
 ```
 
@@ -30,6 +30,14 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.1
+
+Milestone 4 — **attack chain analysis**:
+
+- **`:chains`** links separate hypotheses and findings on an asset into coherent attack scenarios (e.g. exposed interface → weak/anonymous auth → access → insecure configuration). Each chain states its steps, the evidence for the links, the **assumptions that remain unverified**, what evidence is still needed, and the potential impact.
+- Chains are **reasoned scenarios, never proof** — the analyst never claims exploitation or access that wasn't demonstrated, and `not_applicable` hypotheses are excluded. Uses the `attack_chain_analyst` role with a deterministic offline fallback that links conservatively at low confidence.
+- Chains persist in sessions, export bundles, and a dedicated report section.
 
 ## What's New in v1.0
 
@@ -256,6 +264,7 @@ Once inside the client, you have these commands:
 | `:research <port>` | Research a service → ranked, evidence-based vulnerability hypotheses |
 | `:hypotheses` | List recorded research hypotheses |
 | `:validate <id>` | Safely validate one hypothesis (approval + scope + attempt-limited, no brute-force) |
+| `:chains` | Link findings/hypotheses into attack-chain scenarios |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 

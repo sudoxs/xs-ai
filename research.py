@@ -587,6 +587,163 @@ class ResearchEngine:
 
 
 # ---------------------------------------------------------------------------
+# Attack chain analysis — connect separate observations into scenarios
+#
+# The Attack Chain Analyst links individual hypotheses/findings into meaningful
+# paths (e.g. exposed admin -> weak auth -> access -> excessive permissions).
+# It states WHY the steps relate, what evidence supports the link, what remains
+# an ASSUMPTION, what evidence is still needed, and the potential impact. It must
+# never claim successful exploitation or access that was not demonstrated.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AttackChain:
+    id: str
+    title: str
+    asset: str
+    steps: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    needed_evidence: list[str] = field(default_factory=list)
+    impact: str = ""
+    confidence: str = "low"
+    hypothesis_ids: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=_now)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id, "title": self.title, "asset": self.asset,
+            "steps": self.steps, "evidence": self.evidence,
+            "assumptions": self.assumptions, "needed_evidence": self.needed_evidence,
+            "impact": self.impact, "confidence": self.confidence,
+            "hypothesis_ids": self.hypothesis_ids, "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AttackChain":
+        return cls(
+            id=d.get("id", ""), title=d.get("title", ""), asset=d.get("asset", ""),
+            steps=list(d.get("steps", [])), evidence=list(d.get("evidence", [])),
+            assumptions=list(d.get("assumptions", [])),
+            needed_evidence=list(d.get("needed_evidence", [])),
+            impact=d.get("impact", ""), confidence=_normalize_confidence(d.get("confidence", "low")),
+            hypothesis_ids=list(d.get("hypothesis_ids", [])),
+            created_at=d.get("created_at", _now()),
+        )
+
+
+CHAIN_SYSTEM = """\
+You are the Attack Chain Analyst on an authorized red-team. Given this asset's
+vulnerability hypotheses and findings, connect them into coherent attack chains.
+NEVER claim successful exploitation or access that was not demonstrated — chains
+are reasoned scenarios, not proof.
+
+Respond with a SINGLE JSON object, no prose outside it:
+{"chains": [
+  {
+    "title": "short scenario name",
+    "steps": ["ordered step referencing an observation", ...],
+    "evidence": ["what supports linking these steps"],
+    "assumptions": ["what is assumed but NOT verified"],
+    "needed_evidence": ["what to collect to raise confidence"],
+    "impact": "the potential impact IF the chain holds",
+    "confidence": "high|medium|low",
+    "hypothesis_ids": ["H001", ...]
+  }
+]}
+Prefer a few well-justified chains. If nothing links, return {"chains": []}."""
+
+
+def _heuristic_chains(asset: str, hyps: list[dict], start_idx: int) -> list[AttackChain]:
+    """Deterministic, offline chain linking. Conservative: only links hypotheses
+    that plausibly compose, always low confidence with explicit assumptions."""
+    by_cat: dict[str, list[dict]] = {}
+    for h in hyps:
+        if h.get("status") == STATUS_NOT_APPLICABLE:
+            continue
+        by_cat.setdefault(h.get("category", ""), []).append(h)
+
+    chains: list[AttackChain] = []
+    access = [h for h in by_cat.get("authentication", [])]
+    surface = [h for h in by_cat.get("attack-surface", [])]
+    config = [h for h in by_cat.get("configuration", [])]
+    cves = [h for h in by_cat.get("cve", [])]
+
+    # exposed interface + weak/again auth -> unauthorized access
+    for s in surface:
+        for a in access:
+            chains.append(AttackChain(
+                id=f"C{start_idx + len(chains):03d}", asset=asset,
+                title="Exposed interface reachable with weak/anonymous authentication",
+                steps=[s.get("observation", ""), a.get("observation", "")],
+                evidence=[f"{s.get('id','')}: {s.get('service','')}",
+                          f"{a.get('id','')}: {a.get('status','')}"],
+                assumptions=["the exposed interface and the auth weakness are on the same service"],
+                needed_evidence=["validate the authentication weakness (:validate)"],
+                impact="unauthorized access to the service, then further enumeration from inside",
+                confidence="low",
+                hypothesis_ids=[x for x in (s.get("id"), a.get("id")) if x],
+            ))
+    # access + dangerous config -> escalation / impact
+    for a in access:
+        for c in config:
+            if a.get("status") in (STATUS_CONFIRMED, STATUS_SUSPECTED):
+                chains.append(AttackChain(
+                    id=f"C{start_idx + len(chains):03d}", asset=asset,
+                    title="Access combined with an insecure configuration",
+                    steps=[a.get("observation", ""), c.get("observation", "")],
+                    evidence=[f"{a.get('id','')}: {a.get('status','')}",
+                              f"{c.get('id','')}: {c.get('severity','')}"],
+                    assumptions=["the configuration weakness is reachable once access is gained"],
+                    needed_evidence=["demonstrate the configuration is exploitable from the access context"],
+                    impact="privilege escalation or lateral movement from the initial foothold",
+                    confidence="low",
+                    hypothesis_ids=[x for x in (a.get("id"), c.get("id")) if x],
+                ))
+    return chains[:6]
+
+
+def analyze_attack_chains(asset: str, hyps: list[dict], findings: list[str],
+                          client=None, start_idx: int = 1) -> list[AttackChain]:
+    if not hyps:
+        return []
+    if client is None:
+        return _heuristic_chains(asset, hyps, start_idx)
+
+    hyp_lines = "\n".join(
+        f"- {h.get('id','')} [{h.get('category','')}/{h.get('severity','')}/{h.get('status','')}] "
+        f"{h.get('observation','')}" for h in hyps)
+    find_lines = "\n".join(f"- {f}" for f in findings) or "(none)"
+    prompt = (
+        f"Asset: {asset}\n\nHypotheses:\n{hyp_lines}\n\nFindings:\n{find_lines}\n\n"
+        f"Produce attack chains per the JSON schema. Do not claim exploitation."
+    )
+    try:
+        raw = client.run_phase("attack_chain_analyst", prompt, CHAIN_SYSTEM, want_json=True)
+        obj = _loads_relaxed(raw)
+    except Exception:
+        obj = None
+    if not obj or not isinstance(obj.get("chains"), list):
+        return _heuristic_chains(asset, hyps, start_idx)
+
+    out: list[AttackChain] = []
+    for i, c in enumerate(obj["chains"], start=start_idx):
+        if not isinstance(c, dict):
+            continue
+        out.append(AttackChain(
+            id=f"C{i:03d}", asset=asset, title=str(c.get("title", "")).strip(),
+            steps=[str(s) for s in c.get("steps", []) if s],
+            evidence=[str(e) for e in c.get("evidence", []) if e],
+            assumptions=[str(a) for a in c.get("assumptions", []) if a],
+            needed_evidence=[str(n) for n in c.get("needed_evidence", []) if n],
+            impact=str(c.get("impact", "")).strip(),
+            confidence=_normalize_confidence(c.get("confidence", "low")),
+            hypothesis_ids=[str(h) for h in c.get("hypothesis_ids", []) if h],
+        ))
+    return out or _heuristic_chains(asset, hyps, start_idx)
+
+
+# ---------------------------------------------------------------------------
 # Safe credential / authentication validation
 #
 # Strict controls (spec §5): single documented credential or a single

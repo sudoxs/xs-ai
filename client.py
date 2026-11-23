@@ -106,7 +106,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.0
+   PENTEST AI ORCHESTRATOR  v1.1
    by sudoxs
 """
 
@@ -1530,6 +1530,7 @@ class Session:
     target_os: str = ""  # linux, windows, or empty
     imported_from: list[str] = field(default_factory=list)  # handoff provenance
     hypotheses: list[dict] = field(default_factory=list)  # research hypotheses
+    attack_chains: list[dict] = field(default_factory=list)  # linked attack scenarios
 
     @staticmethod
     def _norm_cmd(cmd: str) -> str:
@@ -1602,6 +1603,13 @@ class Session:
             seen_h.add(key)
             self.hypotheses.append(h)
             stats["hypotheses"] += 1
+        seen_c = {(c.get("asset", ""), c.get("title", "")) for c in self.attack_chains}
+        for c in data.get("attack_chains") or []:
+            key = (c.get("asset", ""), c.get("title", ""))
+            if key in seen_c:
+                continue
+            seen_c.add(key)
+            self.attack_chains.append(c)
         stamp = data.get("exported_at") or data.get("saved_at") or "?"
         label = f"{src} @ {stamp}"
         if label not in self.imported_from:
@@ -1621,6 +1629,7 @@ class Session:
             "commands": self._commands_as_dicts(),
             "imported_from": self.imported_from,
             "hypotheses": self.hypotheses,
+            "attack_chains": self.attack_chains,
             "project_memory": generate_project_memory(self),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -1657,6 +1666,7 @@ class Session:
             "commands": self._commands_as_dicts(),
             "imported_from": self.imported_from,
             "hypotheses": self.hypotheses,
+            "attack_chains": self.attack_chains,
             "saved_at": datetime.datetime.now().isoformat(),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
@@ -1676,6 +1686,7 @@ class Session:
             target_os=data.get("target_os", ""),
             imported_from=data.get("imported_from", []),
             hypotheses=data.get("hypotheses", []),
+            attack_chains=data.get("attack_chains", []),
         )
         for rec in data.get("commands", []):
             session.commands.append(CommandRecord(
@@ -2046,6 +2057,22 @@ def generate_report(session: Session, output_dir: str) -> str:
             lines.append(f"| {h.get('id','')} | {h.get('service','')} | {h.get('severity','')} | "
                          f"{h.get('confidence','')} | {h.get('status','')} | {obs} |")
 
+    if session.attack_chains:
+        lines += ["", "---", "", "## Attack Chains",
+                  "", "_Reasoned scenarios linking observations — not proof of exploitation._", ""]
+        for c in session.attack_chains:
+            lines.append(f"### [{c.get('id','')}] {c.get('title','')} "
+                         f"(confidence: {c.get('confidence','low')})")
+            for i, step in enumerate(c.get("steps", []), 1):
+                lines.append(f"{i}. {step}")
+            if c.get("assumptions"):
+                lines.append(f"- **Assumptions:** {'; '.join(c['assumptions'])}")
+            if c.get("needed_evidence"):
+                lines.append(f"- **Evidence needed:** {'; '.join(c['needed_evidence'])}")
+            if c.get("impact"):
+                lines.append(f"- **Potential impact:** {c['impact']}")
+            lines.append("")
+
     lines += ["", "---", "", "## Useful Results", ""]
     for rec in useful:
         prefix = " (remote)" if rec.remote else ""
@@ -2406,6 +2433,7 @@ def show_help():
       :research <port>    Research a service → ranked vulnerability hypotheses
       :hypotheses         List recorded research hypotheses
       :validate <id>      Safely validate one hypothesis (approval + attempt-limited)
+      :chains             Link findings/hypotheses into attack-chain scenarios
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
       :help               Show this help
@@ -3007,6 +3035,39 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                                  f"{h.get('confidence','?')}/{h.get('status','?')}] {h.get('service','')}")
                 if h.get("observation"):
                     cprint("dim", f"       {h['observation']}")
+            continue
+
+        if user_input == ":chains":
+            if research is None:
+                cprint("red", "  Research engine unavailable (research.py not found).")
+                continue
+            if not session.hypotheses:
+                cprint("dim", "  No hypotheses to link yet. Use :research <port> first.")
+                continue
+            cprint("dim", "  Analyzing attack chains across findings and hypotheses...")
+            start = len(session.attack_chains) + 1
+            try:
+                chains = research.analyze_attack_chains(
+                    session.target, session.hypotheses, session.findings,
+                    client=client, start_idx=start)
+            except Exception as exc:
+                cprint("red", f"  Attack-chain analysis error: {exc}")
+                continue
+            if not chains:
+                cprint("dim", "  No meaningful attack chains linking current observations.")
+                continue
+            for ch in chains:
+                session.attack_chains.append(ch.to_dict())
+                cprint("yellow", f"\n  [{ch.id}] {ch.title}  (confidence: {ch.confidence})")
+                for i, step in enumerate(ch.steps, 1):
+                    cprint("green", f"     {i}. {step}")
+                if ch.assumptions:
+                    cprint("magenta", f"     assumptions: {'; '.join(ch.assumptions)}")
+                if ch.needed_evidence:
+                    cprint("dim", f"     need: {'; '.join(ch.needed_evidence)}")
+                if ch.impact:
+                    cprint("dim", f"     impact: {ch.impact}")
+            cprint("dim", f"\n  {len(chains)} chain(s) recorded (not proof of exploitation).")
             continue
 
         if user_input == ":findings":
