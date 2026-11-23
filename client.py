@@ -25,6 +25,10 @@ try:
     import readline  # noqa: F401 — enables input() line editing on Linux
 except ImportError:
     pass
+try:
+    import termios  # POSIX only — used to recover the TTY after subprocesses
+except ImportError:
+    termios = None  # type: ignore
 import shlex
 import socket
 import subprocess
@@ -532,6 +536,7 @@ def check_and_install_tools(tool_names: list[str]) -> dict[str, bool]:
         if install_cmd:
             cprint("dim", f"    {name}: {install_cmd}")
 
+    reset_terminal(flush=True)
     try:
         ans = input(f"  {COLOR['bold']}Install missing tools? [y/n/select]:{COLOR['reset']} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -555,6 +560,7 @@ def check_and_install_tools(tool_names: list[str]) -> dict[str, bool]:
             install_cmd = TOOL_INSTALL_MAP.get(name)
             if not install_cmd:
                 continue
+            reset_terminal(flush=True)
             try:
                 a = input(f"    Install {name}? [y/n]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1285,7 +1291,8 @@ class SSHConnection:
 
     def _build_ssh_cmd(self, cmd: str) -> list[str]:
         args = [
-            "ssh", "-o", "StrictHostKeyChecking=accept-new",
+            "ssh", "-T",  # no remote pty — stops remote commands mangling our TTY
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=8",
             "-o", "BatchMode=yes" if self.key_file else "BatchMode=no",
             "-o", "ControlMaster=auto",
@@ -1921,7 +1928,50 @@ def cprint(color: str, text: str):
     print(f"{COLOR.get(color, '')}{text}{COLOR['reset']}")
 
 
+# ---------------------------------------------------------------------------
+# Terminal hygiene
+#
+# Subprocesses (ssh especially, and any tool that touches the TTY) can leave the
+# terminal with echo or canonical mode turned off. The symptom: you type at an
+# approval prompt but nothing shows up. We snapshot sane terminal settings at
+# startup and restore them before every interactive prompt, and optionally flush
+# any stray keystrokes buffered while a command was running.
+# ---------------------------------------------------------------------------
+
+_ORIG_TTY: list | None = None
+
+
+def save_terminal() -> None:
+    global _ORIG_TTY
+    if termios and sys.stdin.isatty():
+        try:
+            _ORIG_TTY = termios.tcgetattr(sys.stdin.fileno())
+        except Exception:
+            _ORIG_TTY = None
+
+
+def reset_terminal(flush: bool = False) -> None:
+    """Restore echo + line editing before an interactive prompt (no-op off-TTY)."""
+    if not termios or not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    try:
+        if _ORIG_TTY is not None:
+            termios.tcsetattr(fd, termios.TCSANOW, _ORIG_TTY)
+        else:
+            attrs = termios.tcgetattr(fd)
+            attrs[3] |= (termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN)
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        if flush:
+            # discard keys mashed while a command was running so they don't
+            # silently pre-fill (or auto-answer) this prompt
+            termios.tcflush(fd, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def prompt_input(label: str = "xs-ai") -> str:
+    reset_terminal(flush=True)
     try:
         return input(f"\n{COLOR['bold']}[{label}]>{COLOR['reset']} ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -1934,12 +1984,14 @@ def approve(cmd: str, remote: bool = False, warn: str = "") -> bool | str:
     cprint("yellow", f"\n  Command{where}: {cmd}")
     if warn:
         cprint("magenta", f"  ⚠ {warn}")
+    reset_terminal(flush=True)
     try:
         ans = input(f"  {COLOR['bold']}Execute? [y/n/edit]:{COLOR['reset']} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
     if ans == "edit":
+        reset_terminal()
         try:
             edited = input(f"  {COLOR['bold']}New command:{COLOR['reset']} ").strip()
             if edited:
@@ -2022,6 +2074,7 @@ def _run_checks_parallel(checks: list[tuple[str, str]], session: Session,
     for i, (title, cmd) in enumerate(cmds, 1):
         cprint("dim", f"    [{i}] {title}: {cmd}")
     where = " ON THE TARGET (remote)" if session.ssh else ""
+    reset_terminal(flush=True)
     try:
         ans = input(f"  {COLOR['bold']}Run all {len(cmds)} concurrently{where}? [y/n]:{COLOR['reset']} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
@@ -2284,6 +2337,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("green", f"  Credentials set for: {parts[1]}")
             elif len(parts) == 2:
                 session.credentials["username"] = parts[1]
+                reset_terminal(flush=True)
                 pw = getpass.getpass("  Password: ")
                 session.credentials["password"] = pw
                 cprint("green", f"  Credentials set for: {parts[1]}")
@@ -2331,6 +2385,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     ssh_host = spec
 
             if not ssh_user:
+                reset_terminal(flush=True)
                 ssh_user = input("  SSH username: ").strip()
             if not ssh_user:
                 cprint("red", "  Username required.")
@@ -2830,6 +2885,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    # snapshot a sane terminal state so prompts can recover echo after a
+    # subprocess (ssh/apt/etc.) leaves the TTY with echo or canonical mode off
+    save_terminal()
 
     # -- Load role mapping --
     roles = load_roles_file(args.roles)
