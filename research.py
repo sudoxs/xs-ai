@@ -72,6 +72,7 @@ class ServiceFingerprint:
     product: str = ""          # e.g. "Apache httpd", "OpenSSH"
     version: str = ""          # e.g. "2.4.49"
     banner: str = ""           # raw service/version line
+    product_id: str = ""       # canonical product (e.g. "splunk") — routing key
     # how reliable the identification is: "confirmed" (-sV/script), "inferred"
     # (port default), or "guessed"
     reliability: str = "inferred"
@@ -88,8 +89,57 @@ class ServiceFingerprint:
         return {
             "port": self.port, "proto": self.proto, "service": self.service,
             "product": self.product, "version": self.version,
-            "banner": self.banner, "reliability": self.reliability,
+            "banner": self.banner, "product_id": self.product_id,
+            "reliability": self.reliability,
         }
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint normalization — map nmap's service/product/banner strings to a
+# canonical product id so routing keys on the PRODUCT, not the port number.
+# ---------------------------------------------------------------------------
+
+PRODUCT_ALIASES = [
+    ("splunk", re.compile(r"splunk", re.I)),
+    ("tomcat", re.compile(r"tomcat|coyote", re.I)),
+    ("jenkins", re.compile(r"jenkins|hudson", re.I)),
+    ("phpmyadmin", re.compile(r"phpmyadmin", re.I)),
+    ("manageengine", re.compile(r"manageengine|adselfservice|adaudit|fluidic", re.I)),
+    ("gitea", re.compile(r"gitea", re.I)),
+    ("gitlab", re.compile(r"gitlab", re.I)),
+    ("jboss", re.compile(r"jboss|wildfly", re.I)),
+    ("weblogic", re.compile(r"weblogic", re.I)),
+    ("grafana", re.compile(r"grafana", re.I)),
+    ("jira", re.compile(r"jira|atlassian", re.I)),
+    ("elasticsearch", re.compile(r"elasticsearch", re.I)),
+    ("kibana", re.compile(r"kibana", re.I)),
+    ("rabbitmq", re.compile(r"rabbitmq", re.I)),
+]
+
+# Ports a product commonly uses together — scan these even if not in top-ports.
+ASSOCIATED_PORTS = {
+    "splunk": ["8000", "8089"],
+    "tomcat": ["8080", "8005", "8009"],
+    "manageengine": ["8080", "8443", "9251"],
+    "jenkins": ["8080", "50000"],
+    "elasticsearch": ["9200", "9300"],
+    "kibana": ["5601"],
+    "rabbitmq": ["5672", "15672"],
+    "gitlab": ["80", "443", "8080"],
+}
+
+
+def normalize_product(*parts: str) -> str:
+    """Return a canonical product id from any mix of service/product/banner text."""
+    text = " ".join(p for p in parts if p)
+    for canon, rx in PRODUCT_ALIASES:
+        if rx.search(text):
+            return canon
+    return ""
+
+
+def associated_ports(product_id: str) -> list[str]:
+    return list(ASSOCIATED_PORTS.get(product_id, []))
 
 
 # Parse an nmap -sV line like "8080/tcp open  http    Apache httpd 2.4.49"
@@ -119,6 +169,7 @@ def parse_fingerprints(nmap_output: str) -> list[ServiceFingerprint]:
             port=m.group("port"), proto=m.group("proto"),
             service=m.group("service"), product=product, version=version,
             banner=line.strip(),
+            product_id=normalize_product(m.group("service"), product, line),
             reliability="confirmed" if rest else "inferred",
         ))
     return fps
@@ -132,6 +183,7 @@ def fingerprint_for_port(port: str, nmap_output: str = "",
         if fp.port == str(port):
             return fp
     return ServiceFingerprint(port=str(port), service=default_service,
+                              product_id=normalize_product(default_service),
                               reliability="guessed" if not default_service else "inferred")
 
 
@@ -406,8 +458,12 @@ class NVDSource(ResearchSource):
             # extract an affected version range from CPE configurations
             affected = NVDSource._affected_range(cve)
             status, confidence, rationale = assess_cve_applicability(fp, affected)
-            if status == STATUS_NOT_APPLICABLE:
-                continue  # drop CVEs the detected version rules out
+            # Noise reduction: keep only CVEs we can actually tie to this version
+            # (in an affected range, or config-gated). Drop product-name-only and
+            # unknown-version matches that otherwise flood results with 20
+            # irrelevant hypotheses.
+            if status in (STATUS_NOT_APPLICABLE, STATUS_UNVERIFIED):
+                continue
             leads.append({
                 "title": f"{cid}: {desc[:140]}",
                 "category": "cve",
@@ -438,11 +494,60 @@ class NVDSource(ResearchSource):
         return {}
 
 
+class TechniqueKB(ResearchSource):
+    """Product-keyed technique knowledge: non-CVE feature-abuse paths (e.g. the
+    Splunk app-upload scripted-input RCE) that generic port-based enumeration
+    misses. Keyed by canonical product id, not port, so a technique fires from
+    the fingerprint alone — the operator never has to name the product."""
+    name = "technique-kb"
+
+    def __init__(self, tech_dir: str = "techniques"):
+        self.tech_dir = tech_dir
+        self._by_product: dict[str, list[dict]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        self._by_product = {}
+        if not os.path.isdir(self.tech_dir):
+            return
+        for name in sorted(os.listdir(self.tech_dir)):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(self.tech_dir, name), encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            pid = (data.get("product") or "").lower()
+            if pid:
+                self._by_product.setdefault(pid, []).extend(data.get("techniques", []))
+
+    def techniques_for(self, product_id: str) -> list[dict]:
+        return self._by_product.get((product_id or "").lower(), [])
+
+    def query(self, fp: ServiceFingerprint, online: bool) -> list[dict]:
+        leads = []
+        for t in self.techniques_for(fp.product_id):
+            leads.append({
+                "title": t.get("title", ""), "category": "technique",
+                "severity": t.get("severity", "high"),
+                "observation": t.get("title", ""),
+                "validation": " | ".join(t.get("validate_steps", [])),
+                "references": t.get("refs", []), "cves": t.get("cves", []),
+                "technique": t, "source": self.name,
+            })
+        return leads
+
+
 # Extensible registry. Additional sources (CISA KEV, GitHub Security Advisories,
 # vendor advisories, OWASP, MITRE ATT&CK) can be registered here without
 # touching the engine — each only needs to implement query().
-def default_sources(kb_dir: str = "knowledge", extra_notes: str = "") -> list[ResearchSource]:
-    return [LocalKnowledgeBase(kb_dir=kb_dir, extra_notes=extra_notes), NVDSource()]
+def default_sources(kb_dir: str = "knowledge", extra_notes: str = "",
+                    tech_dir: str = "techniques") -> list[ResearchSource]:
+    # TechniqueKB first: technique-first routing before generic CVE lookups.
+    return [TechniqueKB(tech_dir=tech_dir),
+            LocalKnowledgeBase(kb_dir=kb_dir, extra_notes=extra_notes),
+            NVDSource()]
 
 
 # ---------------------------------------------------------------------------
@@ -490,12 +595,59 @@ class ResearchEngine:
                 continue  # a misbehaving source must never break research
         return leads
 
+    def _technique_hypotheses(self, fp: ServiceFingerprint, asset: str,
+                              tech_leads: list[dict], evidence_text: str,
+                              start_idx: int) -> list[Hypothesis]:
+        """Deterministic technique hypotheses (never model-dependent). A product
+        technique reaches strongly_suspected/high from the fingerprint + evidence
+        alone — no CVE required."""
+        ev = " ".join([evidence_text or "", fp.banner or "", fp.product or "",
+                       fp.product_id or "", fp.service or ""]).lower()
+        out: list[Hypothesis] = []
+        for i, lead in enumerate(tech_leads, start=start_idx):
+            t = lead.get("technique", {})
+            signals = [s.lower() for s in t.get("detection_signals", [])]
+            matched = [s for s in signals if s in ev]
+            # product identified (fingerprint already resolved to product_id) and
+            # at least one signal present -> strongly suspected
+            if matched or fp.product_id:
+                status, confidence = STATUS_SUSPECTED, "medium"
+            else:
+                status, confidence = STATUS_UNVERIFIED, "low"
+            # precondition evidence (free license, unauth, default cred, 401) -> high
+            if status == STATUS_SUSPECTED and any(
+                k in ev for k in ("free", "unauthor", "401", "changeme", "no auth", "anonymous")):
+                confidence = "high"
+            vplan = " | ".join(t.get("validate_steps", [])) or lead.get("validation", "")
+            out.append(Hypothesis(
+                id=f"H{i:03d}", asset=asset, service=fp.label(),
+                observation=t.get("title", "") or lead.get("title", ""),
+                evidence=[f"technique-kb: {fp.product_id or fp.service} — "
+                          f"signals matched: {', '.join(matched) or 'product fingerprint'}"]
+                         + ([f"notes: {t['notes']}"] if t.get("notes") else []),
+                references=[r for r in t.get("refs", []) if r],
+                cves=t.get("cves", []),
+                preconditions=t.get("preconditions", []),
+                validation_plan=vplan,
+                severity=_normalize_severity(t.get("severity", "high")),
+                confidence=confidence, status=status, category="technique",
+                validation_hint={"service": fp.service, "port": fp.port,
+                                 "product": fp.product_id, "technique_id": t.get("id", ""),
+                                 "exploit_steps": t.get("exploit_steps", [])},
+            ))
+        return out
+
     def _hypotheses_from_leads(self, fp: ServiceFingerprint, asset: str,
                                leads: list[dict], start_idx: int) -> list[Hypothesis]:
         """Deterministic, offline hypotheses straight from source leads. Used as
         the baseline and as the fallback when no model is available."""
         out: list[Hypothesis] = []
-        for i, lead in enumerate(leads, start=start_idx):
+        idx = start_idx
+        for lead in leads:
+            if lead.get("category") == "technique":
+                continue  # handled by _technique_hypotheses
+            i = idx
+            idx += 1
             status = _normalize_status(lead.get("status", STATUS_UNVERIFIED))
             # a KB config/auth lead with no on-target evidence stays a possibility
             if "status" not in lead:
@@ -519,14 +671,23 @@ class ResearchEngine:
         return out
 
     def investigate(self, fp: ServiceFingerprint, asset: str, client=None,
-                    start_idx: int = 1) -> list[Hypothesis]:
-        """Full investigation: gather leads, let the model synthesize ranked
-        hypotheses when available, else fall back to KB-derived hypotheses."""
+                    start_idx: int = 1, evidence_text: str = "") -> list[Hypothesis]:
+        """Full investigation: technique-first (deterministic, product-keyed),
+        then model-synthesized or KB/CVE hypotheses for everything else."""
         leads = self.gather_leads(fp)
-        baseline = self._hypotheses_from_leads(fp, asset, leads, start_idx)
+        tech_leads = [l for l in leads if l.get("category") == "technique"]
+        other_leads = [l for l in leads if l.get("category") != "technique"]
+
+        # Technique hypotheses are always produced deterministically so a
+        # product's known feature-abuse path never depends on the model.
+        tech_hyps = self._technique_hypotheses(fp, asset, tech_leads, evidence_text, start_idx)
+        next_idx = start_idx + len(tech_hyps)
+
+        def _ranked(rest: list[Hypothesis]) -> list[Hypothesis]:
+            return sorted(tech_hyps + rest, key=lambda h: h.rank_key(), reverse=True)
 
         if client is None:
-            return sorted(baseline, key=lambda h: h.rank_key(), reverse=True)
+            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
 
         lead_lines = "\n".join(
             f"- [{l.get('source','kb')}][{l.get('category','')}/{l.get('severity','')}] "
@@ -550,7 +711,7 @@ class ResearchEngine:
             obj = None
 
         if not obj or not isinstance(obj.get("hypotheses"), list):
-            return sorted(baseline, key=lambda h: h.rank_key(), reverse=True)
+            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
 
         # a documented default credential for this service, so AI-generated auth
         # hypotheses are still validatable through the safe :validate workflow
@@ -559,7 +720,7 @@ class ResearchEngine:
         default_cred = (mod.get("default_credentials") or [None])[0] if mod else None
 
         out: list[Hypothesis] = []
-        for i, h in enumerate(obj["hypotheses"], start=start_idx):
+        for i, h in enumerate(obj["hypotheses"], start=next_idx):
             if not isinstance(h, dict):
                 continue
             category = str(h.get("category", "")).strip()
@@ -582,8 +743,8 @@ class ResearchEngine:
                 category=category, validation_hint=vhint,
             ))
         if not out:
-            return sorted(baseline, key=lambda h: h.rank_key(), reverse=True)
-        return sorted(out, key=lambda h: h.rank_key(), reverse=True)
+            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
+        return _ranked(out)
 
 
 # ---------------------------------------------------------------------------

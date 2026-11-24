@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.3
+   PENTEST AI ORCHESTRATOR  v1.4
    by sudoxs
 ```
 
@@ -30,6 +30,20 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.4
+
+**Technique-first, product-keyed detection** — catches non-CVE feature-abuse on known services (the case that previously slipped through, e.g. the Splunk app-upload → RCE path):
+
+- **Fingerprint normalization** — nmap service/product/banner strings map to a canonical product id (`Splunkd httpd` → `splunk`). Routing keys on the **product**, not the port.
+- **Product-associated ports** — seeing a product pulls in its companion ports even if they weren't in top-ports (`splunk` → `{8000, 8089}`). `:research <port>` deep-scans (`nmap -sCV`) the service and auto-scans the associated ports, so an 8089 management port is no longer missed.
+- **Technique knowledge base** (`techniques/*.json`, product-keyed) — each entry has detection signals, preconditions, and parameterized validate/exploit steps. A technique reaches `strongly_suspected`/`high` from the fingerprint and evidence **without any CVE**. Ships with the Splunk scripted-input RCE technique; extensible per product.
+- **CVE noise reduction** — NVD results that only match the product name (no comparable version range) are dropped, so research no longer floods you with ~20 irrelevant CVE hypotheses.
+- **Known-service findings** — a free-license / unauthenticated instance of a known product (e.g. Splunk) is recorded as a **high-severity finding**, not just a log line.
+- **Real RAG grounding** — technique/KB text for every product discovered in the session is injected into the model context, so free-form questions ("how do I get RCE on Splunk?") are grounded in the actual technique instead of hallucinating unrelated tools.
+- **Recon robustness** — `:ports` now retries (the first scan sometimes returns nothing due to timing) and scans the top-1000 ports.
+
+Acceptance: re-running the Splunk scenario, the tool finds 8089, flags the free/unauthenticated instance as high severity, and proposes the "Splunk app-upload scripted-input RCE" technique as a high hypothesis with validate/exploit steps — without the operator naming Splunk.
 
 ## What's New in v1.3
 
@@ -605,6 +619,7 @@ xs-ai/
 ├── benchmark/cases.json # Benchmark fixtures (data; extensible)
 ├── models.example.json # Copy to models.json to enable multi-model routing
 ├── knowledge/          # Extensible per-service research modules (*.json)
+├── techniques/         # Product-keyed technique modules (non-CVE feature abuse)
 │   ├── http.json
 │   ├── ssh.json
 │   ├── ftp.json

@@ -114,7 +114,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.3
+   PENTEST AI ORCHESTRATOR  v1.4
    by sudoxs
 """
 
@@ -1854,6 +1854,49 @@ markdown fences, no text before or after). Use exactly these keys:
 Put at most one command in "command". Use null/[]/"" for anything not applicable."""
 
 
+_RESEARCH_KB_CACHE: tuple | None = None
+
+
+def _session_product_context(session: Session) -> str:
+    """Technique + knowledge text for every product discovered in this session,
+    so the model is grounded in real techniques for those products during
+    free-form chat (not just the tiny operator cheatsheet)."""
+    if research is None:
+        return ""
+    global _RESEARCH_KB_CACHE
+    if _RESEARCH_KB_CACHE is None:
+        try:
+            _RESEARCH_KB_CACHE = (research.TechniqueKB("techniques"),
+                                  research.LocalKnowledgeBase("knowledge"))
+        except Exception:
+            _RESEARCH_KB_CACHE = (None, None)
+    tkb, lkb = _RESEARCH_KB_CACHE
+    if tkb is None:
+        return ""
+    pids: set[str] = set()
+    for r in session.commands:
+        if "nmap" in r.command and r.output:
+            for fp in research.parse_fingerprints(r.output):
+                if fp.product_id:
+                    pids.add(fp.product_id)
+    for h in session.hypotheses:
+        pid = (h.get("validation_hint") or {}).get("product")
+        if pid:
+            pids.add(pid)
+    chunks: list[str] = []
+    for pid in sorted(pids):
+        for t in tkb.techniques_for(pid):
+            chunks.append(
+                f"# {pid} technique — {t.get('title','')}\n"
+                f"notes: {t.get('notes','')}\n"
+                f"preconditions: {'; '.join(t.get('preconditions', []))}\n"
+                f"validate: {' | '.join(t.get('validate_steps', []))}\n"
+                f"exploit: {' | '.join(t.get('exploit_steps', []))}\n"
+                f"refs: {', '.join(t.get('refs', []))}"
+            )
+    return "\n\n".join(chunks)
+
+
 def build_ai_prompt(session: Session, user_message: str,
                     structured: bool = False) -> tuple[str, str]:
     system_parts = [SYSTEM_BASE, PHASE_PROMPTS.get(session.phase, "")]
@@ -1862,16 +1905,21 @@ def build_ai_prompt(session: Session, user_message: str,
         system_parts.append(f"SSH session active: {session.ssh.label} — commands run on the target.")
     if session.target_os:
         system_parts.append(f"Target OS: {session.target_os}")
-    if session.cheatsheet_context:
-        # Retrieve only the notes relevant to what the operator just asked,
-        # instead of dumping the whole corpus and truncating.
+    # Build the retrieval corpus: operator notes PLUS technique/KB context for
+    # the products already discovered in this session. This is the real RAG fix
+    # — without it, a question like "how do I get RCE on Splunk?" has no grounding
+    # and the model hallucinates (e.g. suggesting SharpHound on a Splunk box).
+    corpus = session.cheatsheet_context or ""
+    product_ctx = _session_product_context(session)
+    if product_ctx:
+        corpus = (corpus + "\n\n---\n\n" + product_ctx) if corpus else product_ctx
+    if corpus:
         relevant_notes = retrieve_relevant(
-            f"{session.phase} {user_message}",
-            session.cheatsheet_context,
-            k=RETRIEVE_CHEAT_K,
+            f"{session.phase} {user_message}", corpus, k=RETRIEVE_CHEAT_K,
         )
         system_parts.append(
-            f"Relevant operator notes (retrieved):\n---\n{relevant_notes}\n---"
+            f"Relevant context (operator notes + discovered-product techniques):\n"
+            f"---\n{relevant_notes}\n---"
         )
     if session.credentials:
         cred_info = ", ".join(f"{k}: {v}" for k, v in session.credentials.items())
@@ -2818,20 +2866,26 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
         if user_input == ":ports":
             cprint("dim", "  Scanning for open ports...")
-            code, output = guarded_run(
-                f"nmap -Pn --top-ports 200 -T4 --open {session.target}",
-                timeout=120,
-            )
-            if code != 0:
-                cprint("red", f"  Scan failed: {output}")
-                continue
+            ports_cmd = f"nmap -Pn -n --top-ports 1000 -T4 --open {session.target}"
             detected: list[str] = []
-            for line in output.splitlines():
-                m = re.match(r"\s*(\d+)/tcp\s+open", line)
-                if m:
-                    detected.append(m.group(1))
+            output = ""
+            # recon robustness: the first scan sometimes returns nothing
+            # (race/timing); retry+verify before concluding there's nothing.
+            for attempt in range(3):
+                code, output = guarded_run(ports_cmd, timeout=180)
+                if output.startswith("[BLOCKED]"):
+                    break
+                detected = [m.group(1) for line in output.splitlines()
+                            if (m := re.match(r"\s*(\d+)/tcp\s+open", line))]
+                if detected:
+                    break
+                if attempt < 2:
+                    cprint("dim", f"  No ports yet — retrying ({attempt + 2}/3)...")
+                    time.sleep(2)
+            if output.startswith("[BLOCKED]"):
+                continue
             if not detected:
-                cprint("yellow", "  No open TCP ports detected.")
+                cprint("yellow", "  No open TCP ports detected after 3 attempts.")
                 continue
             cprint("green", f"  Open ports: {', '.join(detected)}")
             has_checks = [p for p in detected if p in SERVICE_PORT_MAP]
@@ -2843,10 +2897,18 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             else:
                 cprint("dim", "  No service-specific checks for detected ports.")
             rec = CommandRecord(
-                phase="recon", command=f"nmap -Pn --top-ports 200 -T4 --open {session.target}",
+                phase="recon", command=ports_cmd,
                 exit_code=code, output=output, useful=bool(detected), note="port detection",
             )
             session.commands.append(rec)
+            # surface product-associated ports the operator should also research
+            if research is not None:
+                for fpp in research.parse_fingerprints(output):
+                    extra = [p for p in research.associated_ports(fpp.product_id)
+                             if p not in detected]
+                    if extra:
+                        cprint("magenta", f"  {fpp.product_id} detected — also check port(s) "
+                                          f"{', '.join(extra)} (:research {fpp.port} auto-scans them)")
             continue
 
         if user_input == ":tools":
@@ -2960,25 +3022,57 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             port = tokens[1].strip()
             nmap_out = "\n".join(r.output for r in session.commands
                                  if "nmap" in r.command and r.useful)
+            evidence_parts = [nmap_out]
             fp = research.fingerprint_for_port(port, nmap_out)
+            # deep service/version grab (-sCV) if we have no product yet
             if not fp.version and not fp.product:
-                bcmd = f"nmap -Pn -sV -p{port} {session.target}"
-                cprint("yellow", f"  No fingerprint for port {port} yet — grab a banner?")
+                bcmd = f"nmap -sCV -Pn -n -p{port} {session.target}"
+                cprint("yellow", f"  No fingerprint for port {port} yet — deep service scan?")
                 approval = approve(bcmd)
                 if approval is not False:
                     cmd_to_run = approval if isinstance(approval, str) else bcmd
                     cprint("dim", f"  Running: {cmd_to_run}")
-                    code, out = guarded_run(cmd_to_run, timeout=120)
+                    code, out = guarded_run(cmd_to_run, timeout=180)
                     if code == 0:
                         session.commands.append(CommandRecord(
                             phase=session.phase, command=cmd_to_run, exit_code=code,
-                            output=out, useful=True, note=f"banner grab port {port}"))
+                            output=out, useful=True, note=f"deep scan port {port}"))
+                        evidence_parts.append(out)
                         fp = research.fingerprint_for_port(port, out)
+            # product-associated ports: scan the ones we haven't seen yet
+            assoc = research.associated_ports(fp.product_id)
+            known_ports = {f.port for f in research.parse_fingerprints("\n".join(evidence_parts))}
+            missing = [p for p in assoc if p != str(port) and p not in known_ports]
+            if missing:
+                acmd = f"nmap -sCV -Pn -n -p{','.join(missing)} {session.target}"
+                cprint("cyan", f"  {fp.product_id} also uses port(s) {', '.join(missing)} — deep scan them?")
+                approval = approve(acmd)
+                if approval is not False:
+                    cmd_to_run = approval if isinstance(approval, str) else acmd
+                    cprint("dim", f"  Running: {cmd_to_run}")
+                    code, out = guarded_run(cmd_to_run, timeout=180)
+                    if code == 0 and out.strip():
+                        session.commands.append(CommandRecord(
+                            phase=session.phase, command=cmd_to_run, exit_code=code,
+                            output=out, useful=True, note=f"associated ports {','.join(missing)}"))
+                        evidence_parts.append(out)
+            evidence_text = "\n".join(evidence_parts)
+            # a free-license / unauthenticated instance of a known product is a
+            # finding in its own right (high), not just a log line
+            ev_low = evidence_text.lower()
+            if fp.product_id and ("free license" in ev_low or "remote login disabled" in ev_low
+                                  or "401 unauthorized" in ev_low):
+                finding = (f"[{fp.product_id}] free-license / unauthenticated instance exposed "
+                           f"on {session.target} — high severity (feature-abuse path likely)")
+                if finding not in session.findings:
+                    session.findings.append(finding)
+                    cprint("green", f"  FINDING: {finding}")
             cprint("cyan", f"  Researching {fp.label()} on {session.target} "
                            f"(online={'yes' if online else 'no'})...")
             start = len(session.hypotheses) + 1
             try:
-                hyps = research_engine.investigate(fp, session.target, client=client, start_idx=start)
+                hyps = research_engine.investigate(fp, session.target, client=client,
+                                                   start_idx=start, evidence_text=evidence_text)
             except Exception as exc:
                 cprint("red", f"  Research error: {exc}")
                 continue

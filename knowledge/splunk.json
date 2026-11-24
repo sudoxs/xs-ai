@@ -1,0 +1,36 @@
+{
+  "service": "splunk",
+  "aliases": ["splunk", "splunkd", "splunkd httpd", "ssl/http splunkd"],
+  "ports": [8000, 8089],
+  "notes": "Splunk exposes Splunk Web on 8000 and a management API on 8089. A free-license and/or unauthenticated instance is high impact: app upload leads to code execution as the splunk user. Treat an exposed/free/unauth Splunk as a finding in its own right, not a log line.",
+  "checks": [
+    {
+      "id": "splunk-free-or-unauth",
+      "title": "Splunk free-license / unauthenticated instance exposed",
+      "category": "authentication",
+      "severity": "high",
+      "when": "8089 banner says 'free license; remote login disabled', or Splunk Web on 8000 is reachable without auth / with default creds",
+      "validation": "Read the 8089 banner and the 8000 login page; a free license or anonymous/default-cred web access enables app-upload RCE.",
+      "references": ["https://docs.splunk.com/Documentation/Splunk/latest/Security"]
+    },
+    {
+      "id": "splunk-mgmt-port",
+      "title": "Splunk management API on 8089",
+      "category": "attack-surface",
+      "severity": "medium",
+      "when": "8089 is open (often missed by top-ports scans)",
+      "validation": "nmap -sCV -p8089; check /services/server/info for version and licenseState."
+    },
+    {
+      "id": "splunk-default-cred",
+      "title": "Splunk default credentials (admin:changeme)",
+      "category": "authentication",
+      "severity": "high",
+      "when": "Splunk Web login is present",
+      "validation": "Try admin:changeme ONCE on the web login, with operator approval and within scope. No brute-force."
+    }
+  ],
+  "default_credentials": [
+    {"product": "Splunk", "user": "admin", "pass": "changeme", "ref": "https://docs.splunk.com/Documentation/Splunk/latest/Security/Secureyouradminaccount"}
+  ]
+}

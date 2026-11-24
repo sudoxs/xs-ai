@@ -43,7 +43,8 @@ except Exception:  # pragma: no cover
 def h_fingerprint(inp: dict) -> dict:
     fps = R.parse_fingerprints(inp["nmap"])
     fp = next((f for f in fps if f.port == str(inp["port"])), R.ServiceFingerprint(port=str(inp["port"])))
-    return {"service": fp.service, "version": fp.version, "reliability": fp.reliability}
+    return {"service": fp.service, "version": fp.version,
+            "product_id": fp.product_id, "reliability": fp.reliability}
 
 
 def h_applicability(inp: dict) -> dict:

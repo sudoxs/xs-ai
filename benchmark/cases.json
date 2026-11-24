@@ -105,6 +105,21 @@
       "expect": {"top_severity": "critical", "well_formed": true}
     },
     {
+      "id": "technique-first-splunk-rce",
+      "category": "technique-first",
+      "kind": "hypotheses",
+      "input": {"port": 8000, "asset": "10.0.0.5",
+                "nmap": "8000/tcp open  http  Splunkd httpd"},
+      "expect": {"top_severity": "critical", "categories": ["technique"]}
+    },
+    {
+      "id": "product-normalization-splunk",
+      "category": "fingerprint-normalization",
+      "kind": "fingerprint",
+      "input": {"port": 8089, "nmap": "8089/tcp open ssl/http Splunkd httpd (free license; remote login disabled)"},
+      "expect": {"service": "ssl/http", "product_id": "splunk"}
+    },
+    {
       "id": "evidence-quality-wellformed",
       "category": "evidence-quality",
       "kind": "hypotheses",
