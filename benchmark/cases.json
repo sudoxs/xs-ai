@@ -202,6 +202,114 @@
         "want_sections": ["## Findings", "## Research Hypotheses", "## Attack Chains"]
       },
       "expect": {"has_sections": ["## Findings", "## Research Hypotheses", "## Attack Chains"]}
+    },
+
+    {
+      "id": "url-norm-basic",
+      "category": "crawler",
+      "kind": "url_normalize",
+      "input": {"url": "/page?a=1#frag", "base": "https://example.com/dir/index.html"},
+      "expect": {"normalized": "https://example.com/page?a=1"}
+    },
+    {
+      "id": "url-norm-trailing-slash",
+      "category": "crawler",
+      "kind": "url_normalize",
+      "input": {"url": "https://example.com/path/", "base": ""},
+      "expect": {"normalized": "https://example.com/path/"}
+    },
+    {
+      "id": "ssrf-localhost",
+      "category": "crawler",
+      "kind": "ssrf_blocked",
+      "input": {"host": "127.0.0.1"},
+      "expect": {"blocked": true}
+    },
+    {
+      "id": "ssrf-metadata",
+      "category": "crawler",
+      "kind": "ssrf_blocked",
+      "input": {"host": "169.254.169.254"},
+      "expect": {"blocked": true}
+    },
+    {
+      "id": "ssrf-normal-host",
+      "category": "crawler",
+      "kind": "ssrf_blocked",
+      "negative": true,
+      "input": {"host": "example.com"},
+      "expect": {"blocked": false}
+    },
+    {
+      "id": "same-origin-yes",
+      "category": "crawler",
+      "kind": "same_origin",
+      "input": {"url1": "https://example.com/a", "url2": "https://example.com/b"},
+      "expect": {"same_origin": true}
+    },
+    {
+      "id": "same-origin-no",
+      "category": "crawler",
+      "kind": "same_origin",
+      "input": {"url1": "https://example.com/a", "url2": "https://evil.com/b"},
+      "expect": {"same_origin": false}
+    },
+    {
+      "id": "nav-layer-valid",
+      "category": "navigator",
+      "kind": "navigator_layer",
+      "input": {
+        "name": "test-layer",
+        "annotations": [
+          {"technique_id": "T1078", "evidence_level": "observed"},
+          {"technique_id": "T1190", "evidence_level": "ai_recommended"}
+        ]
+      },
+      "expect": {"valid": true, "technique_count": 2, "has_legend": true}
+    },
+    {
+      "id": "ot-modbus-detect",
+      "category": "caldera-ot",
+      "kind": "ot_detect",
+      "input": {"ports": [502, 80, 443]},
+      "expect": {"count": 1}
+    },
+    {
+      "id": "ot-multiple-detect",
+      "category": "caldera-ot",
+      "kind": "ot_detect",
+      "input": {"ports": [502, 102, 4840]},
+      "expect": {"count": 3}
+    },
+    {
+      "id": "ot-no-detect",
+      "category": "caldera-ot",
+      "kind": "ot_detect",
+      "negative": true,
+      "input": {"ports": [80, 443, 22, 8080]},
+      "expect": {"count": 0}
+    },
+    {
+      "id": "advisory-format",
+      "category": "vendor-advisories",
+      "kind": "advisory_format",
+      "input": {"id": "CVE-2024-1234", "vendor": "Apache", "product": "httpd",
+                "cves": ["CVE-2024-1234"], "title": "Path traversal"},
+      "expect": {"has_context": true, "has_source_label": true}
+    },
+    {
+      "id": "mini-yaml-parse",
+      "category": "atomic-red-team",
+      "kind": "mini_yaml",
+      "input": {"yaml_text": "attack_technique: T1059.001\ndisplay_name: PowerShell\natomic_tests:\n  - name: Invoke-Expression test\n    auto_generated_guid: abc12345\n    description: Test PS execution\n    supported_platforms:\n      - windows\n    executor:\n      name: powershell\n      command: |\n        Write-Host test\n"},
+      "expect": {"test_count": 1, "has_name": true}
+    },
+    {
+      "id": "web-classify-api",
+      "category": "web-analysis",
+      "kind": "web_classify",
+      "input": {"node": {"url": "https://example.com/api/v1/users?id=1", "title": "", "content_type": "application/json", "status": 200, "headers": {}}},
+      "expect": {"has_evidence": true}
     }
   ]
 }

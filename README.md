@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.7
+   PENTEST AI ORCHESTRATOR  v1.8
    by sudoxs
 ```
 
@@ -30,6 +30,21 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.8
+
+**Website crawling, graph explorer, web analysis, Atomic Red Team, ATT&CK Navigator, Caldera integration, OT/ICS detection, vendor advisories, and unified cross-component investigation.**
+
+- **Website Crawler** (`:crawl <url>`). BFS crawler with SSRF protection (blocked hosts, DNS rebinding prevention), scope guard enforcement, robots.txt support, redirect chain tracking, same-origin/subdomain scope, pause/resume/cancel. Options: `--depth N`, `--pages N`, `--subdomains`.
+- **Graph Explorer UI** (`:explore`). Embedded single-page HTML/JS app served on `localhost:8477`. Canvas-based radial graph visualization, sidebar with search/filter by status/depth/content-type, page detail panel.
+- **Web Page Analysis** (`:web-analyze`). Evidence-based classification into 8 categories (authentication, admin, API, search, file, parameterized, documentation, interesting). Heuristic signals for metadata-only classification plus AI-enhanced analysis. Investigation queue with add/exclude/pause/resume/cancel.
+- **Atomic Red Team** (`:atomic <path>`). Import Atomic RT YAML test definitions via pure-stdlib mini-YAML parser (PyYAML fallback). Repository with import/dedup/search/platform-filter. `:atomic search <query>` to find tests. **Never auto-executes** — reference only, requires explicit authorization.
+- **ATT&CK Navigator** (`:navigator`). Layer v4.5 generation from investigation data. 4 evidence levels: observed (red), evidence-supported (orange), AI-recommended (blue), unverified (grey). Validation, hypothesis-to-annotation conversion. **Never represents AI recommendations as observed behavior.**
+- **Caldera Integration** (`:caldera [url]`). REST API client for importing abilities and adversaries. Duplicate prevention, technique lookup, search. **Passive by default** — no operation creation, no ability execution.
+- **OT/ICS Detection** (`:caldera-ot <ports>`). 7 ICS/SCADA protocols (Modbus, DNP3, OPC-UA, BACnet, EtherNet/IP, S7comm, IEC 60870-5-104). Port-based protocol detection, ICS ATT&CK technique mapping, risk assessment. **Separate from enterprise assessment** — activates only on relevant ports.
+- **Vendor Advisories** (`:advisories <product>`). Modular provider architecture: MSRC, Apache, Splunk. Official security advisory search, research engine integration, context injection. **Never fabricates advisory information.**
+- **Unified Investigation** (`:investigate`). Cross-component coordination layer bridging all new modules with the existing ResearchEngine. Hypothesis enrichment from Atomic/Caldera/advisories/OT. Full investigation export.
+- **Benchmark expanded** to 36 cases covering URL normalization, SSRF protection, same-origin checks, Navigator layer validation, OT detection, advisory formatting, YAML parsing, and web classification.
 
 ## What's New in v1.7
 

@@ -34,6 +34,30 @@ try:
     import client  # only needed for the report-accuracy handler
 except Exception:  # pragma: no cover
     client = None
+try:
+    import crawler
+except ImportError:
+    crawler = None  # type: ignore
+try:
+    import navigator
+except ImportError:
+    navigator = None  # type: ignore
+try:
+    import atomic_red_team
+except ImportError:
+    atomic_red_team = None  # type: ignore
+try:
+    import caldera_ot
+except ImportError:
+    caldera_ot = None  # type: ignore
+try:
+    import vendor_advisories
+except ImportError:
+    vendor_advisories = None  # type: ignore
+try:
+    import web_analysis
+except ImportError:
+    web_analysis = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +157,86 @@ def h_report(inp: dict) -> dict:
     return {"has_sections": [sec for sec in inp.get("want_sections", []) if sec in text]}
 
 
+def h_url_normalize(inp: dict) -> dict:
+    if crawler is None:
+        return {"error": "crawler not available"}
+    result = crawler.normalize_url(inp["url"], inp.get("base", ""))
+    return {"normalized": result}
+
+
+def h_ssrf_blocked(inp: dict) -> dict:
+    if crawler is None:
+        return {"error": "crawler not available"}
+    blocked = crawler._is_blocked_host(inp["host"])
+    return {"blocked": blocked}
+
+
+def h_same_origin(inp: dict) -> dict:
+    if crawler is None:
+        return {"error": "crawler not available"}
+    result = crawler.same_origin(inp["url1"], inp["url2"])
+    return {"same_origin": result}
+
+
+def h_navigator_layer(inp: dict) -> dict:
+    if navigator is None:
+        return {"error": "navigator not available"}
+    anns = [navigator.TechniqueAnnotation(
+        technique_id=a["technique_id"],
+        evidence_level=a.get("evidence_level", "unverified"),
+    ) for a in inp.get("annotations", [])]
+    layer = navigator.generate_layer(inp.get("name", "test"), "test layer", anns)
+    issues = navigator.validate_layer(layer)
+    tech_count = len(layer.get("techniques", []))
+    has_legend = len(layer.get("legendItems", [])) == 4
+    return {"valid": len(issues) == 0, "technique_count": tech_count,
+            "has_legend": has_legend, "issues": issues}
+
+
+def h_ot_detect(inp: dict) -> dict:
+    if caldera_ot is None:
+        return {"error": "caldera_ot not available"}
+    findings = caldera_ot.detect_ot_protocols(inp["ports"])
+    protocols = sorted(f.protocol for f in findings)
+    return {"detected": protocols, "count": len(findings)}
+
+
+def h_advisory_format(inp: dict) -> dict:
+    if vendor_advisories is None:
+        return {"error": "vendor_advisories not available"}
+    adv = vendor_advisories.VendorAdvisory(
+        advisory_id=inp["id"], vendor=inp["vendor"], product=inp["product"],
+        cves=inp.get("cves", []), title=inp.get("title", ""))
+    ctx = vendor_advisories.format_advisory_context([adv])
+    has_source_label = "official vendor advisory" in ctx
+    return {"has_context": bool(ctx), "has_source_label": has_source_label}
+
+
+def h_mini_yaml(inp: dict) -> dict:
+    if atomic_red_team is None:
+        return {"error": "atomic_red_team not available"}
+    result = atomic_red_team._mini_yaml_parse(inp["yaml_text"])
+    test_count = len(result.get("atomic_tests", []))
+    has_name = bool(result.get("atomic_tests", [{}])[0].get("name", "")) if test_count > 0 else False
+    return {"test_count": test_count, "has_name": has_name}
+
+
+def h_web_classify(inp: dict) -> dict:
+    if web_analysis is None:
+        return {"error": "web_analysis not available"}
+    node = inp["node"]
+    url = node.get("url", "")
+    title = node.get("title", "")
+    ct = node.get("content_type", "")
+    headers = node.get("headers", {})
+    from urllib.parse import urlparse
+    query = urlparse(url).query
+    results = web_analysis._classify_page_heuristic(url, title, ct, headers, query)
+    categories = sorted({r[0] for r in results}) if results else []
+    return {"categories": categories,
+            "has_evidence": len(results) > 0}
+
+
 HANDLERS = {
     "fingerprint": lambda inp, kb: h_fingerprint(inp),
     "applicability": lambda inp, kb: h_applicability(inp),
@@ -144,6 +248,14 @@ HANDLERS = {
     "report": lambda inp, kb: h_report(inp),
     "cve_discipline": h_cve_discipline,
     "gtfobins": h_gtfobins,
+    "url_normalize": lambda inp, kb: h_url_normalize(inp),
+    "ssrf_blocked": lambda inp, kb: h_ssrf_blocked(inp),
+    "same_origin": lambda inp, kb: h_same_origin(inp),
+    "navigator_layer": lambda inp, kb: h_navigator_layer(inp),
+    "ot_detect": lambda inp, kb: h_ot_detect(inp),
+    "advisory_format": lambda inp, kb: h_advisory_format(inp),
+    "mini_yaml": lambda inp, kb: h_mini_yaml(inp),
+    "web_classify": lambda inp, kb: h_web_classify(inp),
 }
 
 

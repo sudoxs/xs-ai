@@ -46,6 +46,34 @@ try:
     import agent as agent_mod
 except ImportError:
     agent_mod = None  # type: ignore
+try:
+    import investigation
+except ImportError:
+    investigation = None  # type: ignore
+try:
+    import crawler
+except ImportError:
+    crawler = None  # type: ignore
+try:
+    import navigator
+except ImportError:
+    navigator = None  # type: ignore
+try:
+    import atomic_red_team
+except ImportError:
+    atomic_red_team = None  # type: ignore
+try:
+    import caldera_adapter
+except ImportError:
+    caldera_adapter = None  # type: ignore
+try:
+    import caldera_ot
+except ImportError:
+    caldera_ot = None  # type: ignore
+try:
+    import vendor_advisories
+except ImportError:
+    vendor_advisories = None  # type: ignore
 import shlex
 import socket
 import subprocess
@@ -118,7 +146,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.7
+   PENTEST AI ORCHESTRATOR  v1.8
    by sudoxs
 """
 
@@ -2459,6 +2487,8 @@ COMMAND_NAMES = [
     ":memory", ":roles", ":scan", ":fullscan", ":findings", ":history", ":report",
     ":save", ":load", ":export", ":import", ":cheat", ":research", ":hypotheses",
     ":validate", ":chains", ":gtfobins", ":models", ":scope", ":agent",
+    ":crawl", ":explore", ":web-analyze", ":atomic", ":navigator", ":caldera",
+    ":caldera-ot", ":advisories", ":investigate",
     ":status", ":help", ":quit",
 ]
 
@@ -2530,6 +2560,16 @@ def show_help():
       :models             Show model registry / routing (multi-model setups)
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :agent [sub]        Agent mode: start|resume|pause|status|log|plan|level <n>
+      :crawl <url>        Crawl a website (BFS, scope-enforced)
+      :explore            Open graph explorer UI in browser
+      :web-analyze        Analyze crawled pages for interesting targets
+      :atomic <path>      Import Atomic Red Team repository
+      :atomic search <q>  Search Atomic tests by keyword
+      :navigator          Export ATT&CK Navigator layer from hypotheses
+      :caldera [url]      Connect to Caldera and import knowledge
+      :caldera-ot <ports> Check ports for OT/ICS protocols
+      :advisories <prod>  Search vendor security advisories
+      :investigate        Export full cross-module investigation report
       :status             Show current session status
       :help               Show this help
       :quit               Exit
@@ -3553,6 +3593,212 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
 
             cprint("red", f"  Unknown agent subcommand: {sub}")
             cprint("dim", "  Usage: :agent [start|resume|pause|status|log|plan|level <n>]")
+            continue
+
+        # --- new module commands ---
+
+        if user_input.startswith(":crawl"):
+            if investigation is None or crawler is None:
+                cprint("red", "  Crawler module unavailable.")
+                continue
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                cprint("red", "  Usage: :crawl <url>  [--depth N] [--pages N] [--subdomains]")
+                continue
+            tokens = parts[1].split()
+            url = tokens[0]
+            depth = 10
+            pages = 500
+            subdomains = False
+            i = 1
+            while i < len(tokens):
+                if tokens[i] == "--depth" and i + 1 < len(tokens):
+                    depth = int(tokens[i + 1]); i += 2
+                elif tokens[i] == "--pages" and i + 1 < len(tokens):
+                    pages = int(tokens[i + 1]); i += 2
+                elif tokens[i] == "--subdomains":
+                    subdomains = True; i += 1
+                else:
+                    i += 1
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            def _crawl_progress(stats):
+                cprint("dim", f"  Crawled {stats.get('total', 0)} pages...")
+            cprint("cyan", f"  Crawling {url} (depth={depth}, max={pages})...")
+            stats = investigation.start_crawl(inv, url, max_depth=depth,
+                                               max_pages=pages,
+                                               allow_subdomains=subdomains,
+                                               on_progress=_crawl_progress)
+            if "error" in stats:
+                cprint("red", f"  Crawl failed: {stats['error']}")
+            else:
+                cprint("green", f"  Crawl complete: {stats}")
+                cprint("dim", investigation.get_crawl_summary(inv))
+            continue
+
+        if user_input.startswith(":explore"):
+            if investigation is None:
+                cprint("red", "  Investigation module unavailable.")
+                continue
+            inv = getattr(interactive_loop, "_inv_ctx", None)
+            if inv is None or inv.website_graph is None:
+                cprint("red", "  No crawl data — run :crawl first.")
+                continue
+            url = investigation.start_explorer_ui(inv)
+            cprint("green", f"  Explorer UI: {url}")
+            continue
+
+        if user_input.startswith(":web-analyze"):
+            if investigation is None:
+                cprint("red", "  Investigation module unavailable.")
+                continue
+            inv = getattr(interactive_loop, "_inv_ctx", None)
+            if inv is None or inv.website_graph is None:
+                cprint("red", "  No crawl data — run :crawl first.")
+                continue
+            analyses = investigation.analyze_crawled_pages(inv)
+            if not analyses:
+                cprint("dim", "  No interesting pages found.")
+            else:
+                cprint("green", f"  Analyzed {len(analyses)} pages:")
+                for a in analyses[:10]:
+                    cats = ", ".join(a.get("categories", []))
+                    cprint("cyan", f"    [{a.get('priority', 0):3d}] {a.get('url', '')} ({cats})")
+            continue
+
+        if user_input.startswith(":atomic"):
+            if atomic_red_team is None:
+                cprint("red", "  Atomic Red Team module unavailable.")
+                continue
+            parts = user_input.split(maxsplit=2)
+            if len(parts) >= 3 and parts[1] == "search":
+                inv = getattr(interactive_loop, "_inv_ctx", None)
+                if inv is None or inv.atomic_repo is None:
+                    cprint("red", "  No Atomic repo loaded. Usage: :atomic <path-to-atomics/>")
+                    continue
+                results = investigation.search_atomic_tests(inv, parts[2])
+                if not results:
+                    cprint("dim", "  No matching tests.")
+                else:
+                    for t in results:
+                        cprint("cyan", f"  [{t['technique_id']}] {t['test_name']} "
+                                       f"({', '.join(t.get('supported_platforms', []))})")
+                continue
+            if len(parts) < 2:
+                cprint("red", "  Usage: :atomic <path-to-atomics/>  or  :atomic search <query>")
+                continue
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            stats = investigation.import_atomic_repo(inv, parts[1])
+            if "error" in stats:
+                cprint("red", f"  Import failed: {stats['error']}")
+            else:
+                cprint("green", f"  Imported: {stats}")
+            continue
+
+        if user_input.startswith(":navigator"):
+            if navigator is None:
+                cprint("red", "  Navigator module unavailable.")
+                continue
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            path = investigation.generate_navigator_layer(inv, session.hypotheses, session.findings)
+            cprint("green", f"  Navigator layer exported: {path}")
+            cprint("dim", "  Open in ATT&CK Navigator: https://mitre-attack.github.io/attack-navigator/")
+            continue
+
+        if user_input.startswith(":caldera-ot"):
+            if caldera_ot is None:
+                cprint("red", "  Caldera OT module unavailable.")
+                continue
+            parts = user_input.split()
+            if len(parts) < 2:
+                cprint("red", "  Usage: :caldera-ot <port1,port2,...>")
+                continue
+            ports = [p.strip() for p in parts[1].split(",")]
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            findings = investigation.check_ot_protocols(inv, ports)
+            if not findings:
+                cprint("dim", "  No OT/ICS protocols detected on those ports.")
+            else:
+                cprint("yellow", f"  OT PROTOCOLS DETECTED ({len(findings)}):")
+                for f in findings:
+                    cprint("yellow", f"    [{f['protocol']}] port {f['port']} — {f['description']}")
+                    for r in f.get("risks", []):
+                        cprint("red", f"      Risk: {r}")
+            continue
+
+        if user_input.startswith(":caldera"):
+            if caldera_adapter is None:
+                cprint("red", "  Caldera adapter module unavailable.")
+                continue
+            parts = user_input.split()
+            url = parts[1] if len(parts) > 1 else ""
+            key = parts[2] if len(parts) > 2 else ""
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            cprint("cyan", "  Connecting to Caldera...")
+            stats = investigation.connect_caldera(inv, url=url, api_key=key)
+            if "error" in stats:
+                cprint("red", f"  {stats['error']}")
+            else:
+                cprint("green", f"  Caldera connected: {stats}")
+            continue
+
+        if user_input.startswith(":advisories"):
+            if vendor_advisories is None:
+                cprint("red", "  Vendor advisories module unavailable.")
+                continue
+            parts = user_input.split(maxsplit=2)
+            if len(parts) < 2:
+                cprint("red", "  Usage: :advisories <product> [vendor]")
+                continue
+            product = parts[1]
+            vendor = parts[2] if len(parts) > 2 else ""
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            cprint("cyan", f"  Searching advisories for {product}...")
+            results = investigation.search_vendor_advisories(inv, product, vendor=vendor)
+            if not results:
+                cprint("dim", "  No advisories found.")
+            else:
+                cprint("green", f"  Found {len(results)} advisories:")
+                for a in results[:10]:
+                    cprint("cyan", f"    [{a['advisory_id']}] {a['vendor']}: {a.get('title', '')}")
+            continue
+
+        if user_input.startswith(":investigate"):
+            if investigation is None:
+                cprint("red", "  Investigation module unavailable.")
+                continue
+            if not hasattr(interactive_loop, "_inv_ctx"):
+                interactive_loop._inv_ctx = investigation.InvestigationContext(
+                    target=session.target, scope_guard=guard,
+                    client=client, online=online, report_dir=report_dir)
+            inv = interactive_loop._inv_ctx
+            report = investigation.export_full_report(inv, session.hypotheses, session.findings)
+            cprint("green", f"  Investigation report exported:")
+            for mod, data in report.get("modules", {}).items():
+                cprint("cyan", f"    {mod}: {data}")
             continue
 
         # --- AI interaction ---
