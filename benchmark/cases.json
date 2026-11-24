@@ -310,6 +310,50 @@
       "kind": "web_classify",
       "input": {"node": {"url": "https://example.com/api/v1/users?id=1", "title": "", "content_type": "application/json", "status": 200, "headers": {}}},
       "expect": {"has_evidence": true}
+    },
+
+    {
+      "id": "agent-cmd-dedup-identical",
+      "category": "agent-dedup",
+      "kind": "agent_normalize",
+      "input": {"cmd1": "nmap -sV -p 80 10.0.0.5", "cmd2": "nmap -sV -p 80 10.0.0.5"},
+      "expect": {"same": true}
+    },
+    {
+      "id": "agent-cmd-dedup-reorder",
+      "category": "agent-dedup",
+      "kind": "agent_normalize",
+      "input": {"cmd1": "nmap -sV -p 80 10.0.0.5", "cmd2": "nmap -p 80 -sV 10.0.0.5"},
+      "expect": {"same": true}
+    },
+    {
+      "id": "agent-cmd-dedup-different",
+      "category": "agent-dedup",
+      "kind": "agent_normalize",
+      "negative": true,
+      "input": {"cmd1": "nmap -sV -p 80 10.0.0.5", "cmd2": "nmap -sV -p 443 10.0.0.5"},
+      "expect": {"same": false}
+    },
+    {
+      "id": "agent-cmd-dedup-whitespace",
+      "category": "agent-dedup",
+      "kind": "agent_normalize",
+      "input": {"cmd1": "nmap  -sV   10.0.0.5 ;", "cmd2": "nmap -sV 10.0.0.5"},
+      "expect": {"same": true}
+    },
+    {
+      "id": "registry-fallback-aware",
+      "category": "model-registry",
+      "kind": "registry_fallback",
+      "input": {
+        "models": [
+          {"name": "fast-model", "provider": "ollama", "model": "fast", "capabilities": ["fast"], "context": 4096},
+          {"name": "reasoning-model", "provider": "ollama", "model": "reason", "capabilities": ["reasoning"], "context": 16384}
+        ],
+        "exclude": "reasoning-model",
+        "role": "planner"
+      },
+      "expect": {"fallback_name": "fast-model"}
     }
   ]
 }

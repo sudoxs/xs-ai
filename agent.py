@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xs-ai agent — semi-autonomous pentest loop.
+xs-ai agent — autonomous pentest loop.
 
 The AgentLoop asks the AI model what to do next, presents the plan to the
 operator (or auto-approves based on the approve-level), executes commands,
@@ -20,14 +20,21 @@ or stop entirely.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
+import shlex
 import signal
+import sys
 import textwrap
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
+
+MAX_AI_CONTEXT = 28_000
+PLAN_INTERVAL = 8
+PLAN_SIZE = 5
 
 SAFE_PREFIXES = (
     "nmap", "curl -s", "curl -k -s", "wget -q", "cat ", "head ", "tail ",
@@ -61,6 +68,9 @@ class Action:
     timestamp: str = ""
 
     def to_dict(self) -> dict:
+        output_hash = ""
+        if self.output and len(self.output) > 2000:
+            output_hash = hashlib.sha256(self.output.encode("utf-8", errors="replace")).hexdigest()[:16]
         return {
             "step": self.step,
             "phase": self.phase,
@@ -70,7 +80,8 @@ class Action:
             "approved": self.approved,
             "executed": self.executed,
             "exit_code": self.exit_code,
-            "output_preview": self.output[:500] if self.output else "",
+            "output": self.output[:4000] if self.output else "",
+            "output_hash": output_hash,
             "skipped": self.skipped,
             "error": self.error,
             "timestamp": self.timestamp,
@@ -88,6 +99,7 @@ class AgentState:
     log_path: str = ""
     start_time: str = ""
     pause_reason: str = ""
+    executed_commands: set[str] = field(default_factory=set)
 
     def elapsed(self) -> str:
         if not self.start_time:
@@ -98,10 +110,29 @@ class AgentState:
         return f"{mins}m{secs:02d}s" if mins else f"{secs}s"
 
 
+def _normalize_command(cmd: str) -> str:
+    """Normalize a command for deduplication: collapse whitespace, strip trailing
+    semicolons, and sort common flag orders so 'nmap -sV -p 80 host' and
+    'nmap -p 80 -sV host' are considered the same."""
+    cmd = cmd.strip()
+    cmd = re.sub(r"\s+", " ", cmd)
+    cmd = cmd.rstrip(";").strip()
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return cmd.lower()
+    if not parts:
+        return cmd.lower()
+    binary = parts[0].lower()
+    flags = sorted(p for p in parts[1:] if p.startswith("-"))
+    args = [p for p in parts[1:] if not p.startswith("-")]
+    return " ".join([binary] + flags + args).lower()
+
+
 DECIDE_SYSTEM = textwrap.dedent("""\
 You are the decision engine of an AI-assisted pentest orchestrator.
 Given the current pentest session state (target, phase, findings, hypotheses,
-command history), decide the SINGLE best next action.
+command history, and your current plan), decide the SINGLE best next action.
 
 Respond with a JSON object:
 {
@@ -123,73 +154,204 @@ Rules:
 - Prefer safe, read-only commands first. Only suggest writes/exploits in
   access/privesc phases.
 - Never suggest commands that could cause denial of service.
-- Never repeat a command that already ran (check command history).
+- NEVER repeat a command that already ran — check the executed commands list.
+  If a similar command was run, choose a different approach or move on.
 - Reference specific hypotheses/findings when deciding.
+- Follow the current plan steps in order when available.
+""")
+
+PLAN_SYSTEM = textwrap.dedent("""\
+You are a pentest planner. Given the current state of the engagement, produce
+a focused plan of exactly {n} concrete next steps.
+
+Respond with a JSON object:
+{{
+  "plan": [
+    "step 1 description",
+    "step 2 description",
+    ...
+  ],
+  "reasoning": "brief explanation of why these steps"
+}}
+
+Rules:
+- Each step must be a concrete, actionable task (not vague like "investigate").
+- Steps should build on each other logically.
+- Consider what commands have already been run — do not re-plan completed work.
+- Focus on the current phase's goals.
+- If findings suggest a pivot, plan the pivot path.
 """)
 
 
 def _build_context(session: Any, state: AgentState) -> str:
-    lines = [
+    """Build AI context with budget management."""
+    budget = MAX_AI_CONTEXT
+    sections: list[str] = []
+
+    # header (always included, ~200 chars)
+    header = "\n".join([
         f"Target: {session.target}",
         f"Phase: {session.phase}",
         f"OS: {session.target_os or 'unknown'}",
         f"Agent step: {state.step}",
         f"Credentials: {json.dumps(session.credentials) if session.credentials else 'none'}",
-        "",
-        "--- Recent commands (last 20) ---",
-    ]
-    for rec in session.commands[-20:]:
-        status = "OK" if rec.useful else f"exit={rec.exit_code}"
-        lines.append(f"  [{rec.phase}] {rec.command}  ({status})")
+    ])
+    sections.append(header)
+    budget -= len(header)
 
+    # plan (high priority, small)
+    if state.plan:
+        plan_text = "\n--- Current Plan ---\n" + "\n".join(
+            f"  {i}. {p}" for i, p in enumerate(state.plan, 1))
+        sections.append(plan_text)
+        budget -= len(plan_text)
+
+    # executed commands set (for dedup awareness)
+    if state.executed_commands:
+        dedup_text = "\n--- Already executed (DO NOT repeat) ---\n"
+        for cmd in sorted(state.executed_commands)[-30:]:
+            dedup_text += f"  {cmd}\n"
+        if len(dedup_text) > budget // 4:
+            dedup_text = dedup_text[:budget // 4] + "\n  ... (truncated)\n"
+        sections.append(dedup_text)
+        budget -= len(dedup_text)
+
+    # hypotheses (high value)
     if session.hypotheses:
-        lines.append("")
-        lines.append("--- Hypotheses ---")
+        hyp_text = "\n--- Hypotheses ---\n"
         for h in session.hypotheses:
             hid = h.get("id", "?")
             sev = h.get("severity", "?")
             stat = h.get("status", "?")
-            obs = h.get("observation", "")[:100]
-            lines.append(f"  {hid}: [{sev}/{stat}] {obs}")
+            obs = h.get("observation", "")[:120]
+            line = f"  {hid}: [{sev}/{stat}] {obs}\n"
+            if len(hyp_text) + len(line) > budget // 3:
+                hyp_text += "  ... (truncated)\n"
+                break
+            hyp_text += line
+        sections.append(hyp_text)
+        budget -= len(hyp_text)
 
+    # findings (high value)
     if session.findings:
-        lines.append("")
-        lines.append("--- Findings ---")
-        for f in session.findings[-10:]:
-            lines.append(f"  {f[:120]}")
+        find_text = "\n--- Findings ---\n"
+        for f in session.findings[-15:]:
+            line = f"  {f[:150]}\n"
+            if len(find_text) + len(line) > budget // 4:
+                find_text += "  ... (truncated)\n"
+                break
+            find_text += line
+        sections.append(find_text)
+        budget -= len(find_text)
 
-    recent_actions = state.actions[-5:]
+    # recent commands with output (use remaining budget)
+    cmd_text = "\n--- Recent commands (last 20) ---\n"
+    for rec in session.commands[-20:]:
+        status = "OK" if rec.useful else f"exit={rec.exit_code}"
+        cmd_text += f"  [{rec.phase}] {rec.command}  ({status})\n"
+    if len(cmd_text) > budget // 2:
+        cmd_text = cmd_text[:budget // 2] + "\n  ... (truncated)\n"
+    sections.append(cmd_text)
+    budget -= len(cmd_text)
+
+    # recent agent actions with fuller output (use remaining budget)
+    recent_actions = state.actions[-8:]
     if recent_actions:
-        lines.append("")
-        lines.append("--- Agent recent actions ---")
+        act_text = "\n--- Agent recent actions ---\n"
         for a in recent_actions:
-            lines.append(f"  step {a.step}: [{a.action_type}] {a.description}")
+            act_text += f"  step {a.step}: [{a.action_type}] {a.description}\n"
             if a.output:
-                lines.append(f"    output: {a.output[:200]}")
+                out_preview = a.output[:min(600, max(100, budget // len(recent_actions)))]
+                act_text += f"    output: {out_preview}\n"
+            if a.error:
+                act_text += f"    error: {a.error[:200]}\n"
+        if len(act_text) > budget:
+            act_text = act_text[:budget] + "\n  ... (truncated)\n"
+        sections.append(act_text)
 
-    return "\n".join(lines)
+    return "\n".join(sections)
 
 
-def decide_next_action(client: Any, session: Any, state: AgentState) -> Action:
+def _generate_plan(
+    client: Any,
+    session: Any,
+    state: AgentState,
+    model_resolver: Callable | None = None,
+) -> list[str]:
+    """Ask the AI to generate a focused plan for the next steps."""
+    context = _build_context(session, state)
+    prompt = f"Current pentest state:\n\n{context}\n\nGenerate a {PLAN_SIZE}-step plan."
+    system = PLAN_SYSTEM.replace("{n}", str(PLAN_SIZE))
+
+    try:
+        if model_resolver:
+            spec = model_resolver("planner")
+            if spec:
+                raw = client.run_phase("recon", prompt, system=system,
+                                       want_json=True, model=spec.model)
+            else:
+                raw = client.run_phase("recon", prompt, system=system, want_json=True)
+        else:
+            raw = client.run_phase("recon", prompt, system=system, want_json=True)
+
+        data = json.loads(raw)
+        plan = data.get("plan", [])
+        if isinstance(plan, list) and plan:
+            return [str(s) for s in plan[:PLAN_SIZE]]
+    except Exception:
+        pass
+    return []
+
+
+def decide_next_action(
+    client: Any,
+    session: Any,
+    state: AgentState,
+    model_resolver: Callable | None = None,
+) -> Action:
     context = _build_context(session, state)
     prompt = f"Current pentest state:\n\n{context}\n\nDecide the next action."
 
-    raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
-                           want_json=True)
+    try:
+        if model_resolver:
+            spec = model_resolver("analyzer")
+            if spec:
+                raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
+                                       want_json=True, model=spec.model)
+            else:
+                raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
+                                       want_json=True)
+        else:
+            raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
+                                   want_json=True)
+    except Exception as exc:
+        return Action(
+            step=state.step,
+            phase=session.phase,
+            action_type="done",
+            description=f"Model error: {exc}",
+            error=str(exc)[:300],
+            timestamp=_now(),
+        )
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
         if m:
-            data = json.loads(m.group())
+            try:
+                data = json.loads(m.group())
+            except json.JSONDecodeError:
+                return Action(
+                    step=state.step, phase=session.phase, action_type="done",
+                    description="Model returned unparseable response",
+                    error=raw[:300], timestamp=_now(),
+                )
         else:
             return Action(
-                step=state.step,
-                phase=session.phase,
-                action_type="done",
+                step=state.step, phase=session.phase, action_type="done",
                 description="Model returned unparseable response",
-                error=raw[:300],
-                timestamp=_now(),
+                error=raw[:300], timestamp=_now(),
             )
 
     state.step += 1
@@ -230,14 +392,15 @@ def _save_log(state: AgentState) -> None:
         "start_time": state.start_time,
         "total_steps": state.step,
         "approve_level": state.approve_level,
+        "plan": state.plan,
         "actions": [a.to_dict() for a in state.actions],
     }
     try:
         os.makedirs(os.path.dirname(state.log_path) or ".", exist_ok=True)
         with open(state.log_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    except OSError:
-        pass
+    except OSError as exc:
+        _cprint("yellow", f"  [Agent] Warning: could not save log: {exc}")
 
 
 def _cprint(color: str, msg: str) -> None:
@@ -274,6 +437,8 @@ def run_agent_loop(
     max_steps: int = 100,
     research_fn=None,
     validate_fn=None,
+    scope_checker=None,
+    model_resolver: Callable | None = None,
 ) -> AgentState:
     _interrupted = [False]
 
@@ -297,6 +462,16 @@ def run_agent_loop(
     _cprint("green", f"  [Agent] Started — level {state.approve_level}, target {session.target}")
     _cprint("dim", "  Press Ctrl+C to pause\n")
 
+    # generate initial plan
+    if not state.plan:
+        _cprint("dim", "  [Agent] Generating initial plan...")
+        state.plan = _generate_plan(client, session, state, model_resolver)
+        if state.plan:
+            _cprint("cyan", "  [Agent] Plan:")
+            for i, p in enumerate(state.plan, 1):
+                _cprint("cyan", f"    {i}. {p}")
+        _save_log(state)
+
     try:
         while state.running and state.step < max_steps:
             if _interrupted[0]:
@@ -305,7 +480,17 @@ def run_agent_loop(
                 _cprint("yellow", "  [Agent] Paused (Ctrl+C)")
                 break
 
-            action = decide_next_action(client, session, state)
+            # re-plan periodically
+            if state.step > 0 and state.step % PLAN_INTERVAL == 0:
+                _cprint("dim", "  [Agent] Re-planning...")
+                new_plan = _generate_plan(client, session, state, model_resolver)
+                if new_plan:
+                    state.plan = new_plan
+                    _cprint("cyan", "  [Agent] Updated plan:")
+                    for i, p in enumerate(state.plan, 1):
+                        _cprint("cyan", f"    {i}. {p}")
+
+            action = decide_next_action(client, session, state, model_resolver)
 
             if action.action_type == "done":
                 action.approved = True
@@ -314,6 +499,17 @@ def run_agent_loop(
                 _cprint("green", f"  [Agent] Done: {action.description}")
                 state.running = False
                 break
+
+            # command deduplication check
+            if action.action_type == "command" and action.command:
+                norm = _normalize_command(action.command)
+                if norm in state.executed_commands:
+                    _cprint("dim", f"  [Agent step {state.step}] SKIP duplicate: {action.command}")
+                    action.skipped = True
+                    action.error = "duplicate command"
+                    state.actions.append(action)
+                    _save_log(state)
+                    continue
 
             if auto_approve(action, state.approve_level):
                 action.approved = True
@@ -349,6 +545,7 @@ def run_agent_loop(
                     action.executed = True
                     action.exit_code = exit_code
                     action.output = output
+                    state.executed_commands.add(_normalize_command(action.command))
                 except Exception as exc:
                     action.error = str(exc)
                     _cprint("red", f"  [Agent] Command error: {exc}")
@@ -375,6 +572,15 @@ def run_agent_loop(
 
             elif action.action_type == "validate" and action.approved:
                 if validate_fn:
+                    # scope check before validation
+                    if scope_checker and action.command:
+                        ok, reason = scope_checker(action.command)
+                        if not ok:
+                            action.error = f"scope blocked: {reason}"
+                            _cprint("red", f"  [Agent] Validate blocked by scope: {reason}")
+                            state.actions.append(action)
+                            _save_log(state)
+                            continue
                     try:
                         validate_fn(action.command)
                         action.executed = True
@@ -404,6 +610,7 @@ def format_status(state: AgentState) -> str:
         f"  Running: {state.running}  Paused: {state.paused}",
         f"  Steps: {state.step}  Approve level: {state.approve_level}",
         f"  Elapsed: {state.elapsed()}",
+        f"  Commands executed: {len(state.executed_commands)}",
     ]
     if state.pause_reason:
         lines.append(f"  Pause reason: {state.pause_reason}")

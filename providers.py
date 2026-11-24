@@ -96,10 +96,13 @@ class ModelRegistry:
 
     def _score(self, spec: ModelSpec, role: str) -> tuple:
         prof = ROLE_PROFILE.get(role, {"caps": [], "min_ctx": 0})
-        cap_hits = sum(1 for c in prof["caps"] if c in spec.capabilities)
+        required_caps = prof["caps"]
+        cap_hits = sum(1 for c in required_caps if c in spec.capabilities)
+        cap_total = len(required_caps) if required_caps else 1
+        cap_ratio = cap_hits / cap_total
         ctx_ok = 1 if spec.context >= prof["min_ctx"] else 0
         role_pref = 1 if role in spec.roles else 0
-        return (role_pref, cap_hits, ctx_ok, spec.context)
+        return (role_pref, cap_ratio, cap_hits, ctx_ok, spec.context)
 
     def resolve_role(self, role: str) -> ModelSpec | None:
         """Explicit assignment first, then capability-based auto-selection."""
@@ -112,11 +115,13 @@ class ModelRegistry:
         best = max(self.models.values(), key=lambda s: self._score(s, role))
         return best
 
-    def fallback_spec(self, exclude: str = "") -> ModelSpec | None:
-        for spec in self.models.values():
-            if spec.name != exclude:
-                return spec
-        return None
+    def fallback_spec(self, exclude: str = "", role: str = "") -> ModelSpec | None:
+        candidates = [s for s in self.models.values() if s.name != exclude]
+        if not candidates:
+            return None
+        if role:
+            candidates.sort(key=lambda s: self._score(s, role), reverse=True)
+        return candidates[0]
 
     def status(self) -> str:
         if not self.models:

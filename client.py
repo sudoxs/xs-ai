@@ -2619,16 +2619,18 @@ def _agent_research(session, engine, client, guard):
     """Trigger the :research pipeline from agent mode."""
     if engine is None or research is None:
         return
-    for fp in session.hypotheses:
-        port = fp.get("port", "")
-        if port:
-            break
-    else:
+    nmap_output = "\n".join(
+        r.output for r in session.commands if "nmap" in r.command and r.output)
+    if not nmap_output.strip():
         return
-    fps = research.parse_fingerprints("\n".join(
-        r.output for r in session.commands if "nmap" in r.command and r.output))
+    fps = research.parse_fingerprints(nmap_output)
+    if not fps:
+        return
     for fp in fps:
-        hyps = engine.investigate(fp, session.target, client=client)
+        try:
+            hyps = engine.investigate(fp, session.target, client=client)
+        except Exception:
+            continue
         start = len(session.hypotheses) + 1
         for i, h in enumerate(hyps, start):
             h.id = f"H{i:03d}"
@@ -2646,10 +2648,21 @@ def _agent_validate(session, engine, client, guard, hypothesis_id):
     if plan:
         for step in plan.get("validate_commands", []):
             cmd = step.get("command", "") if isinstance(step, dict) else str(step)
-            if cmd:
+            if not cmd:
+                continue
+            if guard:
+                ok, reason = guard.check_command(cmd, session.target)
+                if not ok:
+                    guard.audit("blocked", session.target, cmd, reason)
+                    h["last_validate_output"] = f"[BLOCKED] {reason}"
+                    continue
+                guard.audit("execute", session.target, cmd, "agent-validate")
+            try:
                 from subprocess import run as _run
                 r = _run(cmd, shell=True, capture_output=True, text=True, timeout=30)
                 h["last_validate_output"] = r.stdout[:2000]
+            except Exception as exc:
+                h["last_validate_output"] = f"[ERROR] {exc}"
 
 
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
@@ -2705,12 +2718,18 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         guard.audit("execute", session.target, cmd, "local")
         return run_command(cmd, timeout=timeout)
 
+    _model_resolver = None
+    if hasattr(client, "registry") and client.registry:
+        _model_resolver = client.registry.resolve_role
+
     if agent_start and agent_mod and agent_state is not None:
         cprint("cyan", "  [Agent] Auto-starting agent mode (--agent flag)")
         agent_state = agent_mod.run_agent_loop(
             client, session, execute_cmd, agent_state,
             research_fn=lambda: _agent_research(session, research_engine, client, guard),
             validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+            scope_checker=lambda cmd: guard.check_command(cmd, session.target),
+            model_resolver=_model_resolver,
         )
 
     while True:
@@ -3538,6 +3557,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     client, session, execute_cmd, agent_state,
                     research_fn=lambda: _agent_research(session, research_engine, client, guard),
                     validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                    scope_checker=lambda cmd: guard.check_command(cmd, session.target),
+                    model_resolver=_model_resolver,
                 )
                 continue
 
@@ -3550,6 +3571,8 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     client, session, execute_cmd, agent_state,
                     research_fn=lambda: _agent_research(session, research_engine, client, guard),
                     validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                    scope_checker=lambda cmd: guard.check_command(cmd, session.target),
+                    model_resolver=_model_resolver,
                 )
                 continue
 

@@ -58,6 +58,14 @@ try:
     import web_analysis
 except ImportError:
     web_analysis = None  # type: ignore
+try:
+    import agent as agent_mod
+except ImportError:
+    agent_mod = None  # type: ignore
+try:
+    import providers as providers_mod
+except ImportError:
+    providers_mod = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +245,28 @@ def h_web_classify(inp: dict) -> dict:
             "has_evidence": len(results) > 0}
 
 
+def h_agent_normalize(inp: dict) -> dict:
+    if agent_mod is None:
+        return {"error": "agent not available"}
+    n1 = agent_mod._normalize_command(inp["cmd1"])
+    n2 = agent_mod._normalize_command(inp["cmd2"])
+    return {"same": n1 == n2, "norm1": n1, "norm2": n2}
+
+
+def h_registry_fallback(inp: dict) -> dict:
+    if providers_mod is None:
+        return {"error": "providers not available"}
+    reg = providers_mod.ModelRegistry()
+    for m in inp["models"]:
+        spec = providers_mod.ModelSpec(
+            name=m["name"], provider=m["provider"], model=m["model"],
+            capabilities=m.get("capabilities", []), context=m.get("context", 8192),
+        )
+        reg.register(spec)
+    fb = reg.fallback_spec(exclude=inp.get("exclude", ""), role=inp.get("role", ""))
+    return {"fallback_name": fb.name if fb else ""}
+
+
 HANDLERS = {
     "fingerprint": lambda inp, kb: h_fingerprint(inp),
     "applicability": lambda inp, kb: h_applicability(inp),
@@ -256,6 +286,8 @@ HANDLERS = {
     "advisory_format": lambda inp, kb: h_advisory_format(inp),
     "mini_yaml": lambda inp, kb: h_mini_yaml(inp),
     "web_classify": lambda inp, kb: h_web_classify(inp),
+    "agent_normalize": lambda inp, kb: h_agent_normalize(inp),
+    "registry_fallback": lambda inp, kb: h_registry_fallback(inp),
 }
 
 
