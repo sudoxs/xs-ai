@@ -42,6 +42,10 @@ try:
     import connection  # connection modes + diagnostics (optional)
 except ImportError:
     connection = None  # type: ignore
+try:
+    import agent as agent_mod
+except ImportError:
+    agent_mod = None  # type: ignore
 import shlex
 import socket
 import subprocess
@@ -114,7 +118,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.6
+   PENTEST AI ORCHESTRATOR  v1.7
    by sudoxs
 """
 
@@ -2449,6 +2453,38 @@ def run_auto_checks(checks: list[tuple[str, str]], session: Session,
 # Main interactive loop
 # ---------------------------------------------------------------------------
 
+COMMAND_NAMES = [
+    ":phase", ":cred", ":target", ":os", ":ssh", ":ssh-key", ":disconnect",
+    ":shell", ":run", ":rrun", ":auto", ":svc", ":ports", ":tools", ":install",
+    ":memory", ":roles", ":scan", ":fullscan", ":findings", ":history", ":report",
+    ":save", ":load", ":export", ":import", ":cheat", ":research", ":hypotheses",
+    ":validate", ":chains", ":gtfobins", ":models", ":scope", ":agent",
+    ":status", ":help", ":quit",
+]
+
+
+def _command_completer(text: str, state: int):
+    """readline completer: Tab after ':' suggests/completes xs-ai commands."""
+    buf = ""
+    try:
+        buf = readline.get_line_buffer()
+    except Exception:
+        buf = text
+    if not buf.startswith(":"):
+        return None
+    matches = [c + " " for c in COMMAND_NAMES if c.startswith(text or buf.split()[0])]
+    return matches[state] if state < len(matches) else None
+
+
+def setup_completion() -> None:
+    try:
+        readline.set_completer(_command_completer)
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
+    except Exception:
+        pass
+
+
 def show_help():
     print(textwrap.dedent("""
     Commands:
@@ -2493,6 +2529,7 @@ def show_help():
       :gtfobins           Match 'sudo -l' output to GTFOBins privesc paths
       :models             Show model registry / routing (multi-model setups)
       :scope [show|add <t>|clear]  Show/modify authorized target scope
+      :agent [sub]        Agent mode: start|resume|pause|status|log|plan|level <n>
       :status             Show current session status
       :help               Show this help
       :quit               Exit
@@ -2538,12 +2575,52 @@ def show_status(session: Session):
     cprint("green", f"    Findings:    {len(session.findings)}")
 
 
+def _agent_research(session, engine, client, guard):
+    """Trigger the :research pipeline from agent mode."""
+    if engine is None or research is None:
+        return
+    for fp in session.hypotheses:
+        port = fp.get("port", "")
+        if port:
+            break
+    else:
+        return
+    fps = research.parse_fingerprints("\n".join(
+        r.output for r in session.commands if "nmap" in r.command and r.output))
+    for fp in fps:
+        hyps = engine.investigate(fp, session.target, client=client)
+        start = len(session.hypotheses) + 1
+        for i, h in enumerate(hyps, start):
+            h.id = f"H{i:03d}"
+            session.hypotheses.append(h.to_dict())
+
+
+def _agent_validate(session, engine, client, guard, hypothesis_id):
+    """Trigger :validate on a specific hypothesis from agent mode."""
+    if engine is None or research is None:
+        return
+    h = next((h for h in session.hypotheses if h.get("id") == hypothesis_id), None)
+    if h is None:
+        return
+    plan = research.technique_validation_plan(h)
+    if plan:
+        for step in plan.get("validate_commands", []):
+            cmd = step.get("command", "") if isinstance(step, dict) else str(step)
+            if cmd:
+                from subprocess import run as _run
+                r = _run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                h["last_validate_output"] = r.stdout[:2000]
+
+
 def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: set[str],
                      report_dir: str, parallel: bool = False,
                      guard: ScopeGuard | None = None, online: bool = False,
-                     cred_attempts: int = 3, cred_delay: float = 0.0):
+                     cred_attempts: int = 3, cred_delay: float = 0.0,
+                     agent_start: bool = False, approve_level: int = 0):
     guard = guard or ScopeGuard(allow_any=True)  # back-compat if not supplied
+    setup_completion()
     cred_used: dict[str, int] = {}  # hypothesis id -> validation attempts used
+    agent_state = agent_mod.AgentState() if agent_mod else None
     research_engine = None
     if research is not None:
         research_engine = research.ResearchEngine(
@@ -2560,6 +2637,9 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
     if session.commands:
         cprint("green", f"  Resumed session: {len(session.commands)} commands, {len(session.findings)} findings")
     cprint("dim", "  Type :help for commands\n")
+
+    if agent_state and approve_level:
+        agent_state.approve_level = approve_level
 
     ssh_key_file: str | None = None
 
@@ -2584,6 +2664,14 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             return 126, f"[BLOCKED] {reason}"
         guard.audit("execute", session.target, cmd, "local")
         return run_command(cmd, timeout=timeout)
+
+    if agent_start and agent_mod and agent_state is not None:
+        cprint("cyan", "  [Agent] Auto-starting agent mode (--agent flag)")
+        agent_state = agent_mod.run_agent_loop(
+            client, session, execute_cmd, agent_state,
+            research_fn=lambda: _agent_research(session, research_engine, client, guard),
+            validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+        )
 
     while True:
         label = session.phase
@@ -3394,6 +3482,79 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                     cprint("green", f"  Loaded cheat sheet ({len(extra)} chars)")
             continue
 
+        # --- agent commands ---
+        if user_input.startswith(":agent"):
+            if agent_mod is None:
+                cprint("red", "  Agent module unavailable (agent.py not found).")
+                continue
+            parts = user_input.split()
+            sub = parts[1] if len(parts) > 1 else "start"
+
+            if sub == "start":
+                if agent_state.running and not agent_state.paused:
+                    cprint("yellow", "  Agent is already running.")
+                    continue
+                agent_state = agent_mod.run_agent_loop(
+                    client, session, execute_cmd, agent_state,
+                    research_fn=lambda: _agent_research(session, research_engine, client, guard),
+                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                )
+                continue
+
+            if sub == "resume":
+                if not agent_state.paused:
+                    cprint("dim", "  Agent is not paused.")
+                    continue
+                agent_state.paused = False
+                agent_state = agent_mod.run_agent_loop(
+                    client, session, execute_cmd, agent_state,
+                    research_fn=lambda: _agent_research(session, research_engine, client, guard),
+                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                )
+                continue
+
+            if sub == "pause":
+                agent_state.paused = True
+                agent_state.running = False
+                agent_state.pause_reason = "manual"
+                cprint("yellow", "  Agent paused.")
+                continue
+
+            if sub == "status":
+                print(agent_mod.format_status(agent_state))
+                continue
+
+            if sub == "log":
+                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 10
+                print(agent_mod.format_log(agent_state, last_n=n))
+                continue
+
+            if sub == "plan":
+                if not agent_state.plan:
+                    cprint("dim", "  No plan recorded yet.")
+                else:
+                    for i, p in enumerate(agent_state.plan, 1):
+                        cprint("cyan", f"  {i}. {p}")
+                continue
+
+            if sub == "skip":
+                cprint("dim", "  Skip is handled during the agent approval prompt.")
+                continue
+
+            if sub == "level":
+                if len(parts) < 3 or not parts[2].isdigit():
+                    cprint("dim", f"  Current level: {agent_state.approve_level}")
+                    cprint("dim", "  Usage: :agent level <0-3>")
+                    continue
+                lvl = min(3, max(0, int(parts[2])))
+                agent_state.approve_level = lvl
+                cprint("green", f"  Approve level -> {lvl}")
+                continue
+
+            cprint("red", f"  Unknown agent subcommand: {sub}")
+            cprint("dim", "  Usage: :agent [start|resume|pause|status|log|plan|level <n>]")
+            continue
+
         # --- AI interaction ---
         cprint("dim", "  Thinking...")
         structured = getattr(client, "structured", False)
@@ -3513,7 +3674,8 @@ def build_parser() -> argparse.ArgumentParser:
           python3 client.py --host 192.168.198.1 --load sessions/saved.json
         """),
     )
-    p.add_argument("--host", required=True, help="Ollama host IP (Windows)")
+    p.add_argument("--host", default="", help="Ollama host IP (required for Ollama; "
+                                              "not needed for --provider openai/gemini)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Ollama port (default 11434)")
     p.add_argument("--target", help="Initial target IP")
     p.add_argument("--scope", default="scope.json", help="Scope file (default: scope.json)")
@@ -3531,9 +3693,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--os-type", dest="os_type", choices=("linux", "windows"),
                    help="Target OS type")
     p.add_argument("--api", choices=("ollama", "openai", "anthropic"), default="ollama",
-                   help="AI backend (default: ollama)")
-    p.add_argument("--api-key", help="API key for cloud backends (or set XS_API_KEY env)")
-    p.add_argument("--api-url", help="Custom API base URL")
+                   help="Legacy AI backend selector (default: ollama). Prefer --provider.")
+    p.add_argument("--api-key", help="API key for cloud providers (or set XS_API_KEY env)")
+    p.add_argument("--api-url", help="Custom API base URL (legacy; prefer --base-url)")
+    p.add_argument("--provider", choices=("ollama", "openai", "gemini"),
+                   help="LLM provider abstraction. 'openai' is any OpenAI-compatible API "
+                        "(OpenAI, DeepSeek, Groq, Together, OpenRouter, LM Studio) via --base-url.")
+    p.add_argument("--base-url", help="Base URL for --provider openai "
+                                      "(default https://api.openai.com/v1)")
+    p.add_argument("--model", help="Override the model name for --provider")
     p.add_argument("--no-memory", action="store_true",
                    help="Don't load/save project memory (project.md)")
     p.add_argument("--roles", default="roles.json",
@@ -3565,6 +3733,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--connect-mode", choices=("direct", "ssh-tunnel", "vpn"), default="direct",
                    help="Connection mode to the AI host: direct (existing), ssh-tunnel "
                         "(Ollama stays on localhost), or vpn (private overlay IP)")
+    p.add_argument("--agent", action="store_true",
+                   help="Start in agent mode (semi-autonomous pentest loop)")
+    p.add_argument("--approve-level", type=int, default=0, choices=(0, 1, 2, 3),
+                   help="Agent auto-approve level: 0=ask, 1=safe, 2=low-risk, 3=full (default 0)")
     return p
 
 
@@ -3592,7 +3764,33 @@ def main() -> int:
 
     # -- Build AI backend --
     api_key = args.api_key or os.environ.get("XS_API_KEY", "")
-    if args.api == "ollama":
+    client = None
+    provider_mode = bool(args.provider) and providers is not None
+
+    # New provider abstraction (preferred). When --provider is given, the main
+    # client goes through providers.ProviderBackend (chat/list_models/health).
+    if provider_mode:
+        try:
+            prov = providers.make_provider(
+                args.provider, host=eff_host, port=eff_port,
+                base_url=args.base_url or args.api_url or "", api_key=api_key,
+                model=args.model or "")
+        except ValueError as exc:
+            print(f"[FAIL] {exc}")
+            return 1
+        ok, msg = prov.health_check()
+        key_note = f" (key {providers.redact_key(api_key)})" if args.provider != "ollama" else ""
+        if not ok:
+            print(f"[FAIL] Provider {args.provider}: {msg}{key_note}")
+            return 1
+        print(f"[OK] Provider {args.provider} ({prov.model}): {msg}{key_note}")
+        client = providers.ProviderBackend(prov, structured=not args.no_structured, roles=roles)
+
+    elif args.api == "ollama":
+        if not args.host and not args.api_url:
+            print("[FAIL] Ollama needs --host <IP> (or --api-url). "
+                  "For a cloud/compat API use --provider openai/gemini instead.")
+            return 1
         base_url = args.api_url or f"http://{eff_host}:{eff_port}"
         client = AIBackend(
             backend="ollama", base_url=base_url, api_key="",
@@ -3633,7 +3831,8 @@ def main() -> int:
         return 1
 
     # -- Optional multi-model registry (overrides single-backend routing) --
-    if providers is not None:
+    # Skipped in --provider mode: an explicit provider choice wins.
+    if not provider_mode and providers is not None:
         registry = providers.load_registry(args.models)
         if registry.models:
             default_eps = {"ollama": f"http://{eff_host}:{eff_port}",
@@ -3658,19 +3857,21 @@ def main() -> int:
         for r, m in roles.mapping.items():
             print(f"     {r} -> {m}")
 
-    if connection is not None and args.api == "ollama":
+    if connection is not None and not provider_mode and args.api == "ollama":
         ok, msg = connection.diagnose(eff_host, eff_port)
         print(f"[{'OK' if ok else '!'}] Connection check {eff_host}:{eff_port} — {msg}")
 
-    print(f"[*] Connecting to {args.api} at {client.base_url}...")
-    try:
-        models = client.ping()
-        print(f"[OK] Models available: {', '.join(models)}")
-    except Exception as exc:
-        print(f"[FAIL] Cannot reach AI backend: {exc}")
-        if args.api == "ollama":
-            print(f"       Make sure host_setup.ps1 has been run on {args.host}")
-        return 1
+    if not provider_mode:
+        # provider mode already ran health_check; this is the legacy path
+        print(f"[*] Connecting to {args.api} at {client.base_url}...")
+        try:
+            models = client.ping()
+            print(f"[OK] Models available: {', '.join(models)}")
+        except Exception as exc:
+            print(f"[FAIL] Cannot reach AI backend: {exc}")
+            if args.api == "ollama":
+                print(f"       Make sure host_setup.ps1 has been run on {args.host}")
+            return 1
 
     guard = build_scope_guard(args.scope, args.allow_any_target,
                               cli_target=args.target or "", audit_path=args.audit_log)
@@ -3751,7 +3952,9 @@ def main() -> int:
     try:
         interactive_loop(client, session, scope, args.report_dir,
                          parallel=args.parallel, guard=guard, online=args.online,
-                         cred_attempts=args.cred_attempts, cred_delay=args.cred_delay)
+                         cred_attempts=args.cred_attempts, cred_delay=args.cred_delay,
+                         agent_start=getattr(args, 'agent', False),
+                         approve_level=getattr(args, 'approve_level', 0))
     except KeyboardInterrupt:
         print("\n[*] Interrupted.")
     finally:

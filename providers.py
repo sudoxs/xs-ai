@@ -15,9 +15,13 @@ client.py (client passes in a backend factory to avoid a circular import).
 
 from __future__ import annotations
 
+import abc
 import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -214,3 +218,239 @@ class RegistryBackend:
             except Exception:
                 pass
         return names
+
+
+# ===========================================================================
+# Multi-provider LLM abstraction
+#
+# One small interface — chat() / list_models() / health_check() — with concrete
+# providers for Ollama, any OpenAI-compatible API (OpenAI, DeepSeek, Groq,
+# Together, OpenRouter, LM Studio, ...), and Google Gemini. A ProviderBackend
+# adapter exposes the same surface the interactive loop already uses, so the
+# rest of the app never imports a specific provider's HTTP directly.
+# ===========================================================================
+
+AI_TIMEOUT_DEFAULT = 180
+
+
+def redact_key(key: str) -> str:
+    """Never print a full API key — show only the last 4 chars."""
+    if not key:
+        return "(none)"
+    return f"...{key[-4:]}" if len(key) > 4 else "****"
+
+
+class BaseProvider(abc.ABC):
+    name = "base"
+
+    def __init__(self, model: str = "", timeout: int = AI_TIMEOUT_DEFAULT):
+        self.model = model
+        self.timeout = timeout
+
+    @abc.abstractmethod
+    def chat(self, messages: list[dict], temperature: float = 0.15,
+             want_json: bool = False) -> str:
+        ...
+
+    def list_models(self) -> list[str]:
+        return [self.model] if self.model else []
+
+    def health_check(self) -> tuple[bool, str]:
+        try:
+            self.list_models()
+            return True, "ok"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _post_json(self, url: str, payload: dict, headers: dict) -> dict:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data,
+                                     headers={"Content-Type": "application/json", **headers},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def _get_json(self, url: str, headers: dict | None = None) -> dict:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=min(self.timeout, 10)) as resp:
+            return json.loads(resp.read().decode())
+
+
+class OllamaProvider(BaseProvider):
+    name = "ollama"
+
+    def __init__(self, base_url: str, model: str = "", timeout: int = AI_TIMEOUT_DEFAULT):
+        super().__init__(model, timeout)
+        self.base_url = base_url.rstrip("/")
+
+    def chat(self, messages, temperature=0.15, want_json=False) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model, "messages": messages, "stream": False,
+            "options": {"temperature": temperature},
+        }
+        if want_json:
+            payload["format"] = "json"
+        try:
+            result = self._post_json(f"{self.base_url}/api/chat", payload, {})
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise ConnectionError(f"Ollama HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ConnectionError(f"Ollama unreachable: {exc}") from exc
+        return str(result.get("message", {}).get("content", "")).strip()
+
+    def list_models(self) -> list[str]:
+        data = self._get_json(f"{self.base_url}/api/tags")
+        return [m["name"] for m in data.get("models", [])]
+
+    def health_check(self) -> tuple[bool, str]:
+        try:
+            models = self.list_models()
+            return True, f"{len(models)} model(s) available"
+        except Exception as exc:
+            return False, (f"cannot reach Ollama at {self.base_url} ({exc}). "
+                           f"Run host_setup.ps1 on the host and pass --host <IP>.")
+
+
+class OpenAICompatProvider(BaseProvider):
+    """Any OpenAI-compatible /v1/chat/completions endpoint."""
+    name = "openai"
+
+    def __init__(self, base_url: str, api_key: str, model: str = "",
+                 timeout: int = AI_TIMEOUT_DEFAULT):
+        super().__init__(model, timeout)
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def chat(self, messages, temperature=0.15, want_json=False) -> str:
+        payload: dict[str, Any] = {"model": self.model, "messages": messages,
+                                   "temperature": temperature}
+        if want_json:
+            payload["response_format"] = {"type": "json_object"}
+        try:
+            result = self._post_json(f"{self.base_url}/chat/completions", payload, self._headers())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise ConnectionError(f"OpenAI-compat HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ConnectionError(f"OpenAI-compat unreachable at {self.base_url}: {exc}") from exc
+        return str(result["choices"][0]["message"]["content"]).strip()
+
+    def list_models(self) -> list[str]:
+        data = self._get_json(f"{self.base_url}/models", self._headers())
+        return [m.get("id", "") for m in data.get("data", [])][:20]
+
+    def health_check(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, ("no API key — pass --api-key (or set XS_API_KEY). Example: "
+                           "--provider openai --base-url https://api.deepseek.com/v1 "
+                           "--api-key sk-... --model deepseek-chat")
+        try:
+            self.list_models()
+            return True, f"reachable at {self.base_url}"
+        except Exception as exc:
+            return False, f"cannot reach {self.base_url} ({exc}). Check --base-url and --api-key."
+
+
+class GeminiProvider(BaseProvider):
+    """Google AI Studio (generativelanguage.googleapis.com)."""
+    name = "gemini"
+    BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+    def __init__(self, api_key: str, model: str = "gemini-1.5-flash",
+                 timeout: int = AI_TIMEOUT_DEFAULT):
+        super().__init__(model or "gemini-1.5-flash", timeout)
+        self.api_key = api_key
+
+    def chat(self, messages, temperature=0.15, want_json=False) -> str:
+        system = "\n".join(m["content"] for m in messages if m.get("role") == "system")
+        contents = []
+        for m in messages:
+            if m.get("role") == "system":
+                continue
+            role = "model" if m.get("role") == "assistant" else "user"
+            text = m["content"]
+            if system and role == "user" and not contents:
+                text = f"{system}\n\n{text}"
+            contents.append({"role": role, "parts": [{"text": text}]})
+        payload: dict[str, Any] = {"contents": contents,
+                                   "generationConfig": {"temperature": temperature}}
+        if want_json:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+        url = f"{self.BASE}/models/{self.model}:generateContent?key={self.api_key}"
+        try:
+            result = self._post_json(url, payload, {})
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise ConnectionError(f"Gemini HTTP {exc.code}: {detail}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ConnectionError(f"Gemini unreachable: {exc}") from exc
+        try:
+            return str(result["candidates"][0]["content"]["parts"][0]["text"]).strip()
+        except (KeyError, IndexError):
+            return ""
+
+    def list_models(self) -> list[str]:
+        data = self._get_json(f"{self.BASE}/models?key={self.api_key}")
+        return [m.get("name", "").split("/")[-1] for m in data.get("models", [])][:20]
+
+    def health_check(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, "no API key — pass --api-key. Example: --provider gemini --api-key AIza..."
+        try:
+            self.list_models()
+            return True, f"reachable (model {self.model})"
+        except Exception as exc:
+            return False, f"cannot reach Gemini ({exc}). Check --api-key."
+
+
+DEFAULT_BASE_URLS = {"openai": "https://api.openai.com/v1"}
+DEFAULT_MODELS = {"ollama": "qwen2.5-coder:7b", "openai": "gpt-4o-mini",
+                  "gemini": "gemini-1.5-flash"}
+
+
+def make_provider(provider: str, *, host: str = "", port: int = 11434,
+                  base_url: str = "", api_key: str = "", model: str = "",
+                  timeout: int = AI_TIMEOUT_DEFAULT) -> BaseProvider:
+    provider = (provider or "ollama").lower()
+    mdl = model or DEFAULT_MODELS.get(provider, "")
+    if provider == "ollama":
+        url = base_url or f"http://{host or '127.0.0.1'}:{port}"
+        return OllamaProvider(url, mdl, timeout)
+    if provider == "openai":
+        return OpenAICompatProvider(base_url or DEFAULT_BASE_URLS["openai"], api_key, mdl, timeout)
+    if provider == "gemini":
+        return GeminiProvider(api_key, mdl, timeout)
+    raise ValueError(f"unknown provider: {provider}")
+
+
+class ProviderBackend:
+    """Adapts a BaseProvider to the interface the interactive loop uses, so no
+    caller imports a provider's HTTP directly."""
+
+    def __init__(self, provider: BaseProvider, structured: bool = True, roles=None):
+        self.provider = provider
+        self.structured = structured
+        self.roles = roles
+        self.planner_model = self.executor_model = provider.model
+        self.base_url = getattr(provider, "base_url", provider.name)
+
+    def run_phase(self, phase: str, prompt: str, system: str = "",
+                  want_json: bool = False) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.provider.chat(messages, want_json=want_json)
+
+    def analyze(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.run_phase("analyzer", prompt, system, want_json)
+
+    def plan(self, prompt: str, system: str = "", want_json: bool = False) -> str:
+        return self.run_phase("planner", prompt, system, want_json)
+
+    def ping(self) -> list[str]:
+        return self.provider.list_models()

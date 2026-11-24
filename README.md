@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.6
+   PENTEST AI ORCHESTRATOR  v1.7
    by sudoxs
 ```
 
@@ -30,6 +30,14 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.7
+
+**Multi-provider API abstraction, interactive agent mode, and Tab completion.**
+
+- **Multi-provider LLM support** (`--provider ollama|openai|gemini`). `BaseProvider` → `OllamaProvider`, `OpenAICompatProvider` (DeepSeek/Groq/Together/OpenRouter/LM Studio), `GeminiProvider`. Each with `chat()`, `list_models()`, `health_check()`. Use `--base-url` for custom endpoints, `--model` to override, `XS_API_KEY` env for the key. Provider health is verified before the session starts.
+- **Interactive Agent Mode** (`--agent`, or `:agent start` at runtime). A semi-autonomous pentest loop: the AI decides the next action (command, research, validate, phase-change), the operator approves or skips. Four approve levels (`--approve-level 0–3`): 0=ask everything, 1=auto-approve safe/read-only, 2=also low-risk writes, 3=full auto. **Ctrl+C pauses gracefully** — resume with `:agent resume`. JSON action log saved to `reports/agent_*.json`. Subcommands: `:agent start|resume|pause|status|log|plan|level <n>`.
+- **Tab completion for `:` commands.** Press Tab after `:` to cycle through all available commands. Uses readline on Linux/macOS; works inside the interactive loop.
 
 ## What's New in v1.6
 
