@@ -120,6 +120,18 @@
       "expect": {"service": "ssl/http", "product_id": "splunk"}
     },
     {
+      "id": "llm-never-mints-cve",
+      "category": "false-positive-reduction",
+      "kind": "cve_discipline",
+      "negative": true,
+      "input": {
+        "port": 8000,
+        "nmap": "8000/tcp open http Splunkd httpd",
+        "model_json": "{\"hypotheses\":[{\"observation\":\"default creds (CVE-2020-1938)\",\"category\":\"authentication\",\"severity\":\"high\",\"confidence\":\"medium\",\"status\":\"potential_config\",\"cves\":[\"CVE-2020-1938\",\"CVE-2019-1683\"],\"references\":[\"https://nvd.nist.gov/vuln/detail/CVE-2020-1938\"]}]}"
+      },
+      "expect": {"leaked_cves": [], "nvd_links": false, "cve_in_text": false}
+    },
+    {
       "id": "evidence-quality-wellformed",
       "category": "evidence-quality",
       "kind": "hypotheses",

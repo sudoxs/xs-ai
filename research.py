@@ -60,6 +60,16 @@ def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+_CVE_TOKEN_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I)
+
+
+def _strip_cve_tokens(text: str) -> str:
+    """Remove CVE ids from free text so a model can't present an unverified
+    (often fabricated) CVE as fact. Real CVEs are carried only on NVD-sourced
+    hypotheses, never minted by the LLM."""
+    return _CVE_TOKEN_RE.sub("[CVE removed: not from NVD]", text or "")
+
+
 # ---------------------------------------------------------------------------
 # Service fingerprint
 # ---------------------------------------------------------------------------
@@ -363,11 +373,31 @@ class LocalKnowledgeBase(ResearchSource):
                     continue
 
     def module_for(self, fp: ServiceFingerprint) -> dict | None:
+        """Product-FIRST routing. When the fingerprint resolved to a product
+        (e.g. splunk), return that product's module and never a generic module
+        for a *different* product — so a Splunk box doesn't get Tomcat/Jenkins
+        default-credential leads just because the transport is http."""
+        pid = (fp.product_id or "").lower()
         svc = (fp.service or "").lower()
+
+        def names(mod: dict) -> list[str]:
+            return [mod["service"].lower()] + [a.lower() for a in mod.get("aliases", [])]
+
+        # 1) exact product-id match wins
+        if pid:
+            for mod in self._modules:
+                if pid in names(mod):
+                    return mod
+            # product known but no module for it → do NOT fall back to a generic
+            # module of a different product; return nothing (technique KB still fires)
+            return None
+
+        # 2) no product id: match by service name
         for mod in self._modules:
-            aliases = [a.lower() for a in mod.get("aliases", [])] + [mod["service"].lower()]
-            if svc and svc in aliases:
+            if svc and svc in names(mod):
                 return mod
+        # 3) finally by port
+        for mod in self._modules:
             if str(fp.port) in [str(p) for p in mod.get("ports", [])]:
                 return mod
         return None
@@ -676,18 +706,23 @@ class ResearchEngine:
         then model-synthesized or KB/CVE hypotheses for everything else."""
         leads = self.gather_leads(fp)
         tech_leads = [l for l in leads if l.get("category") == "technique"]
-        other_leads = [l for l in leads if l.get("category") != "technique"]
+        nvd_leads = [l for l in leads if l.get("source") == "nvd"]
+        kb_leads = [l for l in leads
+                    if l.get("category") != "technique" and l.get("source") != "nvd"]
 
-        # Technique hypotheses are always produced deterministically so a
-        # product's known feature-abuse path never depends on the model.
+        # Technique + CVE hypotheses are ALWAYS produced deterministically: a
+        # product's feature-abuse path never depends on the model, and CVE ids
+        # come ONLY from NVD — the model is never allowed to mint a CVE.
         tech_hyps = self._technique_hypotheses(fp, asset, tech_leads, evidence_text, start_idx)
-        next_idx = start_idx + len(tech_hyps)
+        nvd_hyps = self._hypotheses_from_leads(fp, asset, nvd_leads, start_idx + len(tech_hyps))
+        base_hyps = tech_hyps + nvd_hyps
+        next_idx = start_idx + len(base_hyps)
 
         def _ranked(rest: list[Hypothesis]) -> list[Hypothesis]:
-            return sorted(tech_hyps + rest, key=lambda h: h.rank_key(), reverse=True)
+            return sorted(base_hyps + rest, key=lambda h: h.rank_key(), reverse=True)
 
         if client is None:
-            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
+            return _ranked(self._hypotheses_from_leads(fp, asset, kb_leads, next_idx))
 
         lead_lines = "\n".join(
             f"- [{l.get('source','kb')}][{l.get('category','')}/{l.get('severity','')}] "
@@ -711,7 +746,7 @@ class ResearchEngine:
             obj = None
 
         if not obj or not isinstance(obj.get("hypotheses"), list):
-            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
+            return _ranked(self._hypotheses_from_leads(fp, asset, kb_leads, next_idx))
 
         # a documented default credential for this service, so AI-generated auth
         # hypotheses are still validatable through the safe :validate workflow
@@ -727,13 +762,18 @@ class ResearchEngine:
             vhint = {"service": fp.service, "port": fp.port}
             if category == "authentication" and default_cred:
                 vhint["default_credential"] = default_cred
+            # HARD RULE: the model may never mint CVE ids or NVD links. CVEs come
+            # only from NVD hypotheses (built above). Strip any CVE the model
+            # emitted — the field, fabricated nvd.nist.gov refs, and CVE tokens
+            # it slipped into the observation.
+            refs = [str(r) for r in h.get("references", []) if r and "nvd.nist.gov" not in str(r)]
             out.append(Hypothesis(
                 id=f"H{i:03d}", asset=asset, service=fp.label(),
-                observation=str(h.get("observation", "")).strip(),
+                observation=_strip_cve_tokens(str(h.get("observation", "")).strip()),
                 evidence=[str(e) for e in h.get("evidence", [])] or
                          [f"model synthesis over {len(leads)} lead(s)"],
-                references=[str(r) for r in h.get("references", []) if r],
-                cves=[str(c) for c in h.get("cves", []) if c],
+                references=refs,
+                cves=[],  # never from the model
                 preconditions=[str(p) for p in h.get("preconditions", []) if p],
                 validation_plan=str(h.get("validation_plan", "")).strip(),
                 severity=_normalize_severity(h.get("severity", "info")),
@@ -743,7 +783,7 @@ class ResearchEngine:
                 category=category, validation_hint=vhint,
             ))
         if not out:
-            return _ranked(self._hypotheses_from_leads(fp, asset, other_leads, next_idx))
+            return _ranked(self._hypotheses_from_leads(fp, asset, kb_leads, next_idx))
         return _ranked(out)
 
 

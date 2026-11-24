@@ -114,7 +114,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.4
+   PENTEST AI ORCHESTRATOR  v1.5
    by sudoxs
 """
 
@@ -3039,10 +3039,13 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                             output=out, useful=True, note=f"deep scan port {port}"))
                         evidence_parts.append(out)
                         fp = research.fingerprint_for_port(port, out)
-            # product-associated ports: scan the ones we haven't seen yet
+            # product-associated ports: deep-scan any that aren't yet richly
+            # fingerprinted (a bare "open" from :ports isn't enough — we need the
+            # -sCV banner, e.g. Splunk 8089's "free license; remote login disabled")
             assoc = research.associated_ports(fp.product_id)
-            known_ports = {f.port for f in research.parse_fingerprints("\n".join(evidence_parts))}
-            missing = [p for p in assoc if p != str(port) and p not in known_ports]
+            deeply_known = {f.port for f in research.parse_fingerprints("\n".join(evidence_parts))
+                            if f.product or f.version}
+            missing = [p for p in assoc if p != str(port) and p not in deeply_known]
             if missing:
                 acmd = f"nmap -sCV -Pn -n -p{','.join(missing)} {session.target}"
                 cprint("cyan", f"  {fp.product_id} also uses port(s) {', '.join(missing)} — deep scan them?")
@@ -3080,10 +3083,24 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 cprint("dim", "  No hypotheses — no leads for this service "
                               "(add a knowledge/ module or try --online).")
                 continue
+            new_findings = 0
             for h in hyps:
                 session.hypotheses.append(h.to_dict())
                 print_hypothesis(h)
+                # Detection-time finding: a well-supported high/critical hypothesis
+                # is recorded as a finding now (before any :validate), so :findings
+                # reflects the risk. :validate later upgrades status to confirmed.
+                if (h.severity in ("high", "critical")
+                        and h.status in (research.STATUS_SUSPECTED, research.STATUS_CONFIRMED)):
+                    finding = (f"[{h.id}] {h.severity.upper()} / {h.status} — "
+                               f"{h.observation} ({h.service})")
+                    if finding not in session.findings:
+                        session.findings.append(finding)
+                        new_findings += 1
             cprint("dim", f"  {len(hyps)} hypotheses recorded — see :hypotheses.")
+            if new_findings:
+                cprint("green", f"  {new_findings} finding(s) recorded — see :findings "
+                                f"(validate to confirm).")
             continue
 
         if user_input.startswith(":validate"):

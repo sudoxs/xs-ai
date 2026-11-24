@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.4
+   PENTEST AI ORCHESTRATOR  v1.5
    by sudoxs
 ```
 
@@ -30,6 +30,14 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.5
+
+Fixes two issues found testing v1.4 on a live Splunk host:
+
+- **Findings are created at detection time.** A well-supported high/critical hypothesis (status `strongly_suspected` or `confirmed`) is recorded as a finding the moment `:research` produces it — plus a dedicated high finding when evidence shows a free-license / unauthenticated instance. `:findings` is no longer empty while a critical hypothesis exists. The lifecycle: **detection → hypothesis** (`strongly_suspected`, high/critical → finding recorded now) **→ `:validate` → `confirmed`** (finding upgraded). The hypothesis's `validation_plan` lists the safe check.
+- **Product-first routing.** Once a service resolves to a product (e.g. `splunk`), generic leads for *other* products are suppressed — a Splunk box no longer gets Tomcat/Jenkins/phpMyAdmin default-credential hypotheses just because the transport is HTTP.
+- **The model can never mint a CVE.** CVE ids come **only** from NVD. Any CVE the LLM emits — in the `cves` field, as a fabricated `nvd.nist.gov` link, or dropped into prose — is stripped. No more misattributed CVE numbers or fake NVD links.
 
 ## What's New in v1.4
 

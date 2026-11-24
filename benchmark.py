@@ -89,6 +89,22 @@ def h_hypotheses(inp: dict, kb_dir: str) -> dict:
             "well_formed": well_formed}
 
 
+def h_cve_discipline(inp: dict, kb_dir: str) -> dict:
+    """Guard: the model must never introduce a CVE. Run investigate with a stub
+    model that fabricates CVEs and check none leak into the hypotheses."""
+    class _FabricatingModel:
+        def run_phase(self, phase, prompt, system="", want_json=False):
+            return inp["model_json"]
+    eng = R.ResearchEngine(sources=R.default_sources(kb_dir, tech_dir="techniques"), online=False)
+    fp = R.fingerprint_for_port(str(inp.get("port", "")), inp.get("nmap", ""))
+    hyps = eng.investigate(fp, "10.0.0.1", client=_FabricatingModel(),
+                           evidence_text=inp.get("nmap", ""))
+    leaked = sorted({c for h in hyps for c in h.cves})
+    nvd_links = any("nvd.nist.gov" in r for h in hyps for r in h.references)
+    cve_in_text = any("CVE-" in h.observation for h in hyps)
+    return {"leaked_cves": leaked, "nvd_links": nvd_links, "cve_in_text": cve_in_text}
+
+
 def h_chains(inp: dict) -> dict:
     chains = R.analyze_attack_chains(inp.get("asset", "10.0.0.1"), inp["hypotheses"],
                                      inp.get("findings", []), client=None)
@@ -118,6 +134,7 @@ HANDLERS = {
     "hypotheses": lambda inp, kb: h_hypotheses(inp, kb),
     "chains": lambda inp, kb: h_chains(inp),
     "report": lambda inp, kb: h_report(inp),
+    "cve_discipline": h_cve_discipline,
 }
 
 
