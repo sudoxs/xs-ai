@@ -114,7 +114,7 @@ BANNER = r"""
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.5
+   PENTEST AI ORCHESTRATOR  v1.6
    by sudoxs
 """
 
@@ -2490,6 +2490,7 @@ def show_help():
       :hypotheses         List recorded research hypotheses
       :validate <id>      Safely validate one hypothesis (approval + attempt-limited)
       :chains             Link findings/hypotheses into attack-chain scenarios
+      :gtfobins           Match 'sudo -l' output to GTFOBins privesc paths
       :models             Show model registry / routing (multi-model setups)
       :scope [show|add <t>|clear]  Show/modify authorized target scope
       :status             Show current session status
@@ -3101,6 +3102,11 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             if new_findings:
                 cprint("green", f"  {new_findings} finding(s) recorded — see :findings "
                                 f"(validate to confirm).")
+            tech = next((h for h in hyps if h.category == "technique"
+                         and (h.validation_hint or {}).get("validate_commands")), None)
+            if tech:
+                cprint("cyan", f"  Next: :validate {tech.id} to run safe checks; then "
+                               f":phase access → :validate {tech.id} for full exploit steps.")
             continue
 
         if user_input.startswith(":validate"):
@@ -3116,6 +3122,68 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             if not hyp:
                 cprint("red", f"  No hypothesis {hid}. Use :hypotheses to list them.")
                 continue
+
+            # --- technique hypotheses: multi-step safe validation + phase-gated exploit ---
+            vhint = hyp.get("validation_hint", {}) or {}
+            if hyp.get("category") == "technique" and vhint.get("validate_commands"):
+                used = cred_used.get(hid, 0)
+                if used >= cred_attempts:
+                    cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}).")
+                    continue
+                user = session.credentials.get("username") or vhint.get("default_credential", {}).get("user", "admin")
+                pw = session.credentials.get("password") or vhint.get("default_credential", {}).get("pass", "changeme")
+                plan = research.technique_validation_plan(hyp, session.target, user, pw)
+                cprint("cyan", f"  Validating {hid} — {len(plan)} safe read-only checks "
+                               f"(attempt {used + 1}/{cred_attempts}):")
+                results, aborted = [], False
+                for step in plan:
+                    approval = approve(step["cmd"], warn=step["desc"])
+                    if approval is False:
+                        cprint("dim", "  Skipped this check.")
+                        results.append({**step, "code": 1, "output": ""})
+                        continue
+                    run_cmd = approval if isinstance(approval, str) else step["cmd"]
+                    code, out = guarded_run(run_cmd, timeout=60)
+                    if out.startswith("[BLOCKED]"):
+                        aborted = True
+                        break
+                    guard.audit("validate", session.target, run_cmd, f"technique {hid}")
+                    cprint("dim", f"    {step['desc']}: {out.strip()[:80]}")
+                    results.append({**step, "code": code, "output": out})
+                if aborted:
+                    continue
+                cred_used[hid] = used + 1
+                ok, msg, info = research.eval_technique_validation(results)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                hyp["status"] = research.STATUS_CONFIRMED if ok else hyp.get("status")
+                if ok:
+                    hyp["confidence"] = "high"
+                hyp.setdefault("evidence", []).append(
+                    f"[validate {ts}] {msg} (license={info.get('license','?')})")
+                cprint("green" if ok else "yellow", f"  -> {msg}  [license={info.get('license','?')}]")
+                if ok:
+                    finding = f"[{hid}] VALIDATED: {hyp.get('observation','')} ({session.target})"
+                    if finding not in session.findings:
+                        session.findings.append(finding)
+                        cprint("green", f"  FINDING: {finding}")
+                # exploit steps are access-phase only
+                if ok and session.phase == "access":
+                    reset_terminal(flush=True)
+                    lhost = input("  LHOST (your listener IP): ").strip() or "{lhost}"
+                    reset_terminal(flush=True)
+                    lport = input("  LPORT [4444]: ").strip() or "4444"
+                    steps = research.technique_exploit_steps(
+                        hyp, session.target, lhost, lport, user, pw)
+                    cprint("magenta", f"\n  Exploit steps for {hid} (operator-executed; authorized scope only):")
+                    for n, s in enumerate(steps, 1):
+                        print(f"  --- step {n} ---")
+                        print("  " + s.replace("\n", "\n  "))
+                    guard.audit("exploit_shown", session.target, hid, "technique exploit steps displayed")
+                elif ok:
+                    cprint("dim", "  Switch to :phase access and re-run "
+                                  f":validate {hid} to see the full exploit steps.")
+                continue
+
             cmd, kind = research.build_validation(hyp, session.target)
             if cmd is None:
                 cprint("yellow", f"  {kind}")
@@ -3155,6 +3223,48 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 if finding not in session.findings:
                     session.findings.append(finding)
                     cprint("green", f"  FINDING: {finding}")
+            continue
+
+        if user_input == ":gtfobins":
+            if research is None:
+                cprint("red", "  Research engine unavailable (research.py not found).")
+                continue
+            sudo_out = ""
+            for r in reversed(session.commands):
+                if "sudo" in r.command and "-l" in r.command and r.output:
+                    sudo_out = r.output
+                    break
+            if not sudo_out:
+                cprint("dim", "  No 'sudo -l' output in history. Run it first, e.g. "
+                              ":rrun sudo -l  (or :run sudo -n -l), then :gtfobins.")
+                continue
+            gtfo = research.load_gtfobins()
+            bins = research.parse_sudo_l(sudo_out)
+            matches = research.gtfobins_lookup(bins, gtfo)
+            if not matches:
+                cprint("dim", f"  No GTFOBins sudo privesc for: {', '.join(bins) or '(none parsed)'}")
+                continue
+            cprint("cyan", f"\n  GTFOBins privesc paths ({len(matches)}):")
+            start = len(session.hypotheses) + 1
+            for i, m in enumerate(matches, start):
+                hid = f"H{i:03d}"
+                cprint("yellow", f"  [{hid}] sudo {m['binary']} — {', '.join(m['functions']) or 'privesc'}")
+                cprint("green", f"       {m['sudo']}")
+                if m["ref"]:
+                    cprint("dim", f"       {m['ref']}")
+                hyp = research.Hypothesis(
+                    id=hid, asset=session.target, service=f"sudo/{m['binary']}",
+                    observation=f"sudo {m['binary']} is a GTFOBins privesc ({', '.join(m['functions'])})",
+                    evidence=[f"sudo -l grants {m['binary']}"], references=[m["ref"]] if m["ref"] else [],
+                    validation_plan=m["sudo"], severity="high", confidence="high",
+                    status=research.STATUS_SUSPECTED, category="privesc",
+                    validation_hint={"binary": m["binary"]},
+                )
+                session.hypotheses.append(hyp.to_dict())
+                finding = f"[{hid}] PRIVESC: sudo {m['binary']} (GTFOBins) on {session.target}"
+                if finding not in session.findings:
+                    session.findings.append(finding)
+            cprint("dim", f"  Recorded {len(matches)} privesc hypothesis/finding(s).")
             continue
 
         if user_input == ":hypotheses":

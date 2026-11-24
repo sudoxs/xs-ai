@@ -124,6 +124,10 @@ PRODUCT_ALIASES = [
     ("elasticsearch", re.compile(r"elasticsearch", re.I)),
     ("kibana", re.compile(r"kibana", re.I)),
     ("rabbitmq", re.compile(r"rabbitmq", re.I)),
+    ("postgresql", re.compile(r"postgresql|postgres", re.I)),
+    ("mysql", re.compile(r"mysql|mariadb", re.I)),
+    ("mssql", re.compile(r"microsoft sql server|ms-?sql", re.I)),
+    ("mongodb", re.compile(r"mongodb", re.I)),
 ]
 
 # Ports a product commonly uses together — scan these even if not in top-ports.
@@ -136,6 +140,10 @@ ASSOCIATED_PORTS = {
     "kibana": ["5601"],
     "rabbitmq": ["5672", "15672"],
     "gitlab": ["80", "443", "8080"],
+    "postgresql": ["5432"],
+    "mysql": ["3306"],
+    "mssql": ["1433"],
+    "mongodb": ["27017"],
 }
 
 
@@ -663,7 +671,10 @@ class ResearchEngine:
                 confidence=confidence, status=status, category="technique",
                 validation_hint={"service": fp.service, "port": fp.port,
                                  "product": fp.product_id, "technique_id": t.get("id", ""),
-                                 "exploit_steps": t.get("exploit_steps", [])},
+                                 "validate_commands": t.get("validate_commands", []),
+                                 "exploit_steps": t.get("exploit_steps", []),
+                                 "default_credential": (t.get("default_credential")
+                                                        or {"user": "admin", "pass": "changeme"})},
             ))
         return out
 
@@ -984,6 +995,73 @@ def shlex_quote(s: str) -> str:
     return shlex.quote(s or "")
 
 
+def _fill(template: str, mapping: dict) -> str:
+    """Substitute {key} placeholders without str.format (shell/heredoc bodies
+    contain characters that would break .format)."""
+    out = template or ""
+    for k, v in mapping.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+def technique_validation_plan(hyp: dict, target: str, user: str = "admin",
+                              pw: str = "changeme") -> list[dict]:
+    """Parameterized, SAFE (read-only) validation commands for a technique
+    hypothesis — the three curls that prove the Splunk app-upload path is open,
+    for example. Returns [] when the technique has no automated validation."""
+    vh = hyp.get("validation_hint", {}) or {}
+    m = {"target": target, "user": user, "pass": pw}
+    plan = []
+    for c in vh.get("validate_commands", []):
+        plan.append({
+            "cmd": _fill(c.get("cmd", ""), m),
+            "expect": c.get("expect", ""),
+            "required": c.get("required", True),
+            "desc": c.get("desc", ""),
+        })
+    return plan
+
+
+def _check_expect(expect: str, exit_code: int, output: str) -> bool:
+    if not expect:
+        return True
+    out = output or ""
+    if expect.startswith("contains:"):
+        return expect.split(":", 1)[1].lower() in out.lower()
+    if expect.isdigit():  # e.g. an HTTP code printed to stdout by curl -w
+        return expect in out
+    return expect.lower() in out.lower()
+
+
+def eval_technique_validation(results: list[dict]) -> tuple[bool, str, dict]:
+    """Decide whether a technique is validated from the run results. Required
+    steps must pass; informational steps (e.g. license read) only annotate."""
+    ok_all, notes, license_mode = True, [], "unknown"
+    for r in results:
+        passed = _check_expect(r.get("expect", ""), r.get("code", 0), r.get("output", ""))
+        if "license" in r.get("desc", "").lower():
+            low = (r.get("output", "") or "").lower()
+            license_mode = ("free" if "free" in low
+                            else "enterprise" if "enterprise" in low else "unknown")
+        if r.get("required", True) and not passed:
+            ok_all = False
+        notes.append(f"{r.get('desc','step')}: {'ok' if passed else 'no'}")
+    msg = ("VALIDATED — target is exploitable via this technique"
+           if ok_all else "validation incomplete — required check(s) did not pass")
+    return ok_all, msg, {"license": license_mode, "notes": notes}
+
+
+def technique_exploit_steps(hyp: dict, target: str, lhost: str, lport: str,
+                            user: str = "admin", pw: str = "changeme",
+                            interval: str = "10") -> list[str]:
+    """Fill a technique's exploit steps with session parameters. Shown only in
+    the access phase, after a successful validation, with operator approval."""
+    vh = hyp.get("validation_hint", {}) or {}
+    m = {"target": target, "lhost": lhost, "lport": lport,
+         "user": user, "pass": pw, "interval": interval}
+    return [_fill(s, m) for s in vh.get("exploit_steps", [])]
+
+
 def classify_validation(kind: str, service: str, exit_code: int,
                         output: str) -> tuple[str, str, str, str]:
     """Map a validation command's result to (status, confidence, auth_state, note).
@@ -1023,6 +1101,50 @@ def classify_validation(kind: str, service: str, exit_code: int,
                 f"inconclusive (HTTP {code or '?'}, exit {exit_code})")
 
     return (STATUS_UNVERIFIED, "low", AUTH_UNKNOWN, f"inconclusive (exit {exit_code})")
+
+
+# ---------------------------------------------------------------------------
+# GTFOBins — post-foothold privesc lookup from `sudo -l`
+#
+# After a foothold, `sudo -l` shows which binaries the user may run as root.
+# Match them against a local GTFOBins table to propose a concrete privesc path.
+# ---------------------------------------------------------------------------
+
+def load_gtfobins(path: str = os.path.join("knowledge", "gtfobins.json")) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def parse_sudo_l(output: str) -> list[str]:
+    """Extract binary names the user may run via sudo from `sudo -l` output."""
+    bins: set[str] = set()
+    for line in (output or "").splitlines():
+        low = line.lower()
+        if "nopasswd" in low or "(all" in low or "(root" in low or line.strip().startswith("/"):
+            # every absolute path on the line -> basename
+            for m in re.finditer(r"/[\w./-]+/([\w.-]+)", line):
+                name = m.group(1)
+                bins.add(name)
+                if name.endswith((".sh", ".py", ".pl")):
+                    bins.add(name.rsplit(".", 1)[0])
+    return sorted(bins)
+
+
+def gtfobins_lookup(binaries: list[str], gtfo: dict) -> list[dict]:
+    """Return GTFOBins sudo privesc entries for the matched binaries."""
+    out = []
+    for b in binaries:
+        entry = gtfo.get(b) or gtfo.get(b.lower())
+        if entry and entry.get("sudo"):
+            out.append({
+                "binary": b, "functions": entry.get("functions", []),
+                "sudo": entry["sudo"], "ref": entry.get("ref", ""),
+            })
+    return out
 
 
 def _loads_relaxed(text: str) -> dict | None:

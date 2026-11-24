@@ -120,6 +120,29 @@
       "expect": {"service": "ssl/http", "product_id": "splunk"}
     },
     {
+      "id": "technique-first-postgres-rce",
+      "category": "technique-first",
+      "kind": "hypotheses",
+      "input": {"port": 5432, "asset": "10.0.0.5",
+                "nmap": "5432/tcp open  postgresql  PostgreSQL DB 11.7"},
+      "expect": {"top_severity": "critical", "categories": ["technique"]}
+    },
+    {
+      "id": "gtfobins-tail-sudo",
+      "category": "privesc-lookup",
+      "kind": "gtfobins",
+      "input": {"sudo": "User mark may run the following commands on box:\n    (ALL) NOPASSWD: /usr/bin/tail"},
+      "expect": {"matched": ["tail"], "functions": ["file-read"]}
+    },
+    {
+      "id": "gtfobins-no-false-privesc",
+      "category": "false-positive-reduction",
+      "kind": "gtfobins",
+      "negative": true,
+      "input": {"sudo": "(ALL) NOPASSWD: /usr/local/bin/totallysafe"},
+      "expect": {"matched": []}
+    },
+    {
       "id": "llm-never-mints-cve",
       "category": "false-positive-reduction",
       "kind": "cve_discipline",

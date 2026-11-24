@@ -89,6 +89,14 @@ def h_hypotheses(inp: dict, kb_dir: str) -> dict:
             "well_formed": well_formed}
 
 
+def h_gtfobins(inp: dict, kb_dir: str) -> dict:
+    gtfo = R.load_gtfobins(os.path.join(kb_dir, "gtfobins.json"))
+    bins = R.parse_sudo_l(inp["sudo"])
+    matches = R.gtfobins_lookup(bins, gtfo)
+    return {"matched": sorted(m["binary"] for m in matches),
+            "functions": sorted({f for m in matches for f in m["functions"]})}
+
+
 def h_cve_discipline(inp: dict, kb_dir: str) -> dict:
     """Guard: the model must never introduce a CVE. Run investigate with a stub
     model that fabricates CVEs and check none leak into the hypotheses."""
@@ -135,6 +143,7 @@ HANDLERS = {
     "chains": lambda inp, kb: h_chains(inp),
     "report": lambda inp, kb: h_report(inp),
     "cve_discipline": h_cve_discipline,
+    "gtfobins": h_gtfobins,
 }
 
 
