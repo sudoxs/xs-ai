@@ -26,15 +26,14 @@ import os
 import re
 import shlex
 import signal
-import sys
 import textwrap
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 MAX_AI_CONTEXT = 28_000
 PLAN_INTERVAL = 8
 PLAN_SIZE = 5
+STALL_THRESHOLD = 5
 
 SAFE_PREFIXES = (
     "nmap", "curl -s", "curl -k -s", "wget -q", "cat ", "head ", "tail ",
@@ -100,6 +99,7 @@ class AgentState:
     start_time: str = ""
     pause_reason: str = ""
     executed_commands: set[str] = field(default_factory=set)
+    _last_progress_step: int = 0
 
     def elapsed(self) -> str:
         if not self.start_time:
@@ -112,8 +112,8 @@ class AgentState:
 
 def _normalize_command(cmd: str) -> str:
     """Normalize a command for deduplication: collapse whitespace, strip trailing
-    semicolons, and sort common flag orders so 'nmap -sV -p 80 host' and
-    'nmap -p 80 -sV host' are considered the same."""
+    semicolons, and sort flag groups (keeping flag-value pairs together) so
+    'nmap -sV -p 80 host' and 'nmap -p 80 -sV host' are considered the same."""
     cmd = cmd.strip()
     cmd = re.sub(r"\s+", " ", cmd)
     cmd = cmd.rstrip(";").strip()
@@ -124,9 +124,23 @@ def _normalize_command(cmd: str) -> str:
     if not parts:
         return cmd.lower()
     binary = parts[0].lower()
-    flags = sorted(p for p in parts[1:] if p.startswith("-"))
-    args = [p for p in parts[1:] if not p.startswith("-")]
-    return " ".join([binary] + flags + args).lower()
+    flag_groups: list[list[str]] = []
+    positional: list[str] = []
+    i = 1
+    while i < len(parts):
+        token = parts[i]
+        if token.startswith("-"):
+            group = [token]
+            if i + 1 < len(parts) and not parts[i + 1].startswith("-"):
+                group.append(parts[i + 1])
+                i += 1
+            flag_groups.append(group)
+        else:
+            positional.append(token)
+        i += 1
+    flag_groups.sort(key=lambda g: g[0].lower())
+    flat_flags = [t for g in flag_groups for t in g]
+    return " ".join([binary] + flat_flags + positional).lower()
 
 
 DECIDE_SYSTEM = textwrap.dedent("""\
@@ -284,16 +298,7 @@ def _generate_plan(
     system = PLAN_SYSTEM.replace("{n}", str(PLAN_SIZE))
 
     try:
-        if model_resolver:
-            spec = model_resolver("planner")
-            if spec:
-                raw = client.run_phase("recon", prompt, system=system,
-                                       want_json=True, model=spec.model)
-            else:
-                raw = client.run_phase("recon", prompt, system=system, want_json=True)
-        else:
-            raw = client.run_phase("recon", prompt, system=system, want_json=True)
-
+        raw = client.run_phase("recon", prompt, system=system, want_json=True)
         data = json.loads(raw)
         plan = data.get("plan", [])
         if isinstance(plan, list) and plan:
@@ -313,17 +318,8 @@ def decide_next_action(
     prompt = f"Current pentest state:\n\n{context}\n\nDecide the next action."
 
     try:
-        if model_resolver:
-            spec = model_resolver("analyzer")
-            if spec:
-                raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
-                                       want_json=True, model=spec.model)
-            else:
-                raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
-                                       want_json=True)
-        else:
-            raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
-                                   want_json=True)
+        raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
+                               want_json=True)
     except Exception as exc:
         return Action(
             step=state.step,
@@ -365,6 +361,21 @@ def decide_next_action(
     )
 
 
+_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:;|&&|\|\||\|(?!\|)|`|\$\()\s*")
+_SHELL_REDIRECT_RE = re.compile(r"\s*(?:[12]?>|>>)\s*")
+
+
+def _extract_simple_commands(cmd: str) -> list[str]:
+    """Split a command on shell compound operators. Returns each sub-command."""
+    parts = _COMPOUND_SPLIT_RE.split(cmd)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _has_shell_redirect(cmd: str) -> bool:
+    """Check if a command contains shell output redirects (> or >>)."""
+    return bool(_SHELL_REDIRECT_RE.search(cmd))
+
+
 def auto_approve(action: Action, level: int) -> bool:
     if level >= 3:
         return True
@@ -374,9 +385,19 @@ def auto_approve(action: Action, level: int) -> bool:
         return level >= 1
     if action.action_type == "command":
         cmd = action.command.strip().lower()
-        if level >= 1 and any(cmd.startswith(p) for p in SAFE_PREFIXES):
+        if _has_shell_redirect(cmd):
+            return False
+        sub_cmds = _extract_simple_commands(cmd)
+        if not sub_cmds:
+            return False
+        if level >= 1 and all(
+            any(sc.startswith(p) for p in SAFE_PREFIXES) for sc in sub_cmds
+        ):
             return True
-        if level >= 2 and any(cmd.startswith(p) for p in LOW_RISK_PREFIXES):
+        if level >= 2 and all(
+            any(sc.startswith(p) for p in SAFE_PREFIXES + LOW_RISK_PREFIXES)
+            for sc in sub_cmds
+        ):
             return True
     return False
 
@@ -591,6 +612,23 @@ def run_agent_loop(
 
             state.actions.append(action)
             _save_log(state)
+
+            # stall detection: pause if N consecutive steps yield no new
+            # findings, no new executed commands, and no phase changes
+            made_progress = (
+                action.action_type == "command" and action.executed and action.output
+            ) or (
+                action.action_type == "set_phase" and action.executed
+            )
+            if made_progress:
+                state._last_progress_step = state.step
+            elif state.step - state._last_progress_step >= STALL_THRESHOLD:
+                _cprint("yellow",
+                         f"  [Agent] Stall detected — {STALL_THRESHOLD} steps "
+                         "with no new output. Pausing for operator review.")
+                state.paused = True
+                state.pause_reason = "stall-detected"
+                break
 
     except Exception as exc:
         _cprint("red", f"  [Agent] Crash: {exc}")

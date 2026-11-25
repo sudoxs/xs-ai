@@ -1069,6 +1069,9 @@ def load_scope(path: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_URL_HOST_RE = re.compile(r"(?:https?|ftp)://([^/:@\s\]]+)")
+_IPV6_RE = re.compile(r"(?:::ffff:)?(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}"
+                       r"|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}")
 
 
 @dataclass
@@ -1116,8 +1119,24 @@ class ScopeGuard:
             return True, "in scope"
         return False, f"{target} is not in the authorized scope"
 
+    def _extract_hosts(self, command: str) -> set[str]:
+        """Extract all host references from a command: IPv4, IPv6, URL hostnames."""
+        hosts: set[str] = set()
+        hosts.update(_IPV4_RE.findall(command))
+        hosts.update(_URL_HOST_RE.findall(command))
+        for v6 in _IPV6_RE.findall(command):
+            mapped = v6.lower()
+            if mapped.startswith("::ffff:"):
+                hosts.add(mapped[7:])
+            else:
+                hosts.add(mapped)
+        hosts.discard("127.0.0.1")
+        hosts.discard("0.0.0.0")
+        hosts.discard("localhost")
+        return hosts
+
     def check_command(self, command: str, session_target: str) -> tuple[bool, str]:
-        """Authorize an execution: the session target AND every IPv4 literal in
+        """Authorize an execution: the session target AND every host reference in
         the command must be in scope (stops an AI/typed command from reaching an
         out-of-scope host)."""
         ok, reason = self.check(session_target)
@@ -1125,11 +1144,9 @@ class ScopeGuard:
             return ok, reason
         if self.allow_any:
             return True, reason
-        for ip in set(_IPV4_RE.findall(command)):
-            if ip in ("127.0.0.1", "0.0.0.0"):
-                continue
-            if not self._host_matches(ip):
-                return False, f"command references out-of-scope host {ip}"
+        for host in self._extract_hosts(command):
+            if not self._host_matches(host):
+                return False, f"command references out-of-scope host {host}"
         return True, "in scope"
 
     def check_free_command(self, command: str) -> tuple[bool, str]:
@@ -1137,11 +1154,9 @@ class ScopeGuard:
         unless the command names an out-of-scope host (fail-closed per IP)."""
         if self.allow_any:
             return True, "scope enforcement disabled"
-        for ip in set(_IPV4_RE.findall(command)):
-            if ip in ("127.0.0.1", "0.0.0.0"):
-                continue
-            if not self.configured or not self._host_matches(ip):
-                return False, f"command references out-of-scope host {ip}"
+        for host in self._extract_hosts(command):
+            if not self.configured or not self._host_matches(host):
+                return False, f"command references out-of-scope host {host}"
         return True, "ok"
 
     def audit(self, event: str, target: str, command: str, extra: str = "") -> None:
@@ -1479,7 +1494,7 @@ class SSHConnection:
     def _build_ssh_cmd(self, cmd: str) -> list[str]:
         args = [
             "ssh", "-T",  # no remote pty — stops remote commands mangling our TTY
-            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "StrictHostKeyChecking=yes",
             "-o", "ConnectTimeout=8",
             "-o", "BatchMode=yes" if self.key_file else "BatchMode=no",
             "-o", "ControlMaster=auto",
@@ -2637,7 +2652,7 @@ def _agent_research(session, engine, client, guard):
             session.hypotheses.append(h.to_dict())
 
 
-def _agent_validate(session, engine, client, guard, hypothesis_id):
+def _agent_validate(session, engine, client, guard, hypothesis_id, execute_fn=None):
     """Trigger :validate on a specific hypothesis from agent mode."""
     if engine is None or research is None:
         return
@@ -2658,9 +2673,13 @@ def _agent_validate(session, engine, client, guard, hypothesis_id):
                     continue
                 guard.audit("execute", session.target, cmd, "agent-validate")
             try:
-                from subprocess import run as _run
-                r = _run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-                h["last_validate_output"] = r.stdout[:2000]
+                if execute_fn:
+                    exit_code, output = execute_fn(cmd)
+                    h["last_validate_output"] = output[:2000]
+                else:
+                    from subprocess import run as _run
+                    r = _run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+                    h["last_validate_output"] = r.stdout[:2000]
             except Exception as exc:
                 h["last_validate_output"] = f"[ERROR] {exc}"
 
@@ -2727,7 +2746,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         agent_state = agent_mod.run_agent_loop(
             client, session, execute_cmd, agent_state,
             research_fn=lambda: _agent_research(session, research_engine, client, guard),
-            validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+            validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
             scope_checker=lambda cmd: guard.check_command(cmd, session.target),
             model_resolver=_model_resolver,
         )
@@ -3556,7 +3575,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 agent_state = agent_mod.run_agent_loop(
                     client, session, execute_cmd, agent_state,
                     research_fn=lambda: _agent_research(session, research_engine, client, guard),
-                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
                     scope_checker=lambda cmd: guard.check_command(cmd, session.target),
                     model_resolver=_model_resolver,
                 )
@@ -3570,7 +3589,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 agent_state = agent_mod.run_agent_loop(
                     client, session, execute_cmd, agent_state,
                     research_fn=lambda: _agent_research(session, research_engine, client, guard),
-                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid),
+                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
                     scope_checker=lambda cmd: guard.check_command(cmd, session.target),
                     model_resolver=_model_resolver,
                 )
