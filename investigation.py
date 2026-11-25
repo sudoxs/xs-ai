@@ -133,7 +133,7 @@ def start_crawl(ctx: InvestigationContext, url: str,
 def get_crawl_summary(ctx: InvestigationContext) -> str:
     if crawler is None or ctx.website_graph is None:
         return "No crawl data available."
-    return crawler.format_crawl_summary(ctx.website_graph)
+    return crawler.format_crawl_summary(ctx.website_graph, ctx.crawl_state)
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +153,14 @@ def start_explorer_ui(ctx: InvestigationContext, port: int = 8477) -> str:
     for pid, node in ctx.website_graph.nodes.items():
         nd = {
             "id": pid,
-            "url": node.url if hasattr(node, "url") else (list(node.urls)[0] if node.urls else ""),
+            "url": node.normalized_url or node.original_url,
             "title": node.title or "",
-            "status": node.status,
-            "depth": node.depth,
+            "status": node.http_status,
+            "depth": node.crawl_depth,
             "content_type": node.content_type or "",
-            "size": node.size,
-            "outgoing": list(node.outgoing),
-            "incoming": list(node.incoming),
+            "size": node.response_size,
+            "outgoing": list(node.outgoing_links),
+            "incoming": list(node.incoming_links),
         }
         graph_data["nodes"].append(nd)
 
@@ -183,21 +183,26 @@ def analyze_crawled_pages(ctx: InvestigationContext) -> list[dict]:
     if web_analysis is None or ctx.website_graph is None:
         return []
 
-    graph_dict = {}
+    nodes_dict: dict[str, dict] = {}
     for pid, node in ctx.website_graph.nodes.items():
-        graph_dict[pid] = {
-            "url": node.url if hasattr(node, "url") else (list(node.urls)[0] if node.urls else ""),
+        nodes_dict[pid] = {
+            "page_id": pid,
+            "normalized_url": node.normalized_url,
             "title": node.title or "",
-            "status": node.status,
+            "http_status": node.http_status,
             "content_type": node.content_type or "",
-            "size": node.size,
-            "headers": node.headers if hasattr(node, "headers") else {},
-            "depth": node.depth,
+            "response_size": node.response_size,
+            "headers": node.headers if isinstance(node.headers, dict) else {},
+            "crawl_depth": node.crawl_depth,
+            "crawl_status": node.crawl_status,
+            "redirect_chain": node.redirect_chain,
+            "incoming_links": node.incoming_links,
+            "outgoing_links": node.outgoing_links,
         }
 
-    analyses = web_analysis.analyze_graph(graph_dict)
+    analyses = web_analysis.analyze_graph({"nodes": nodes_dict})
     ctx.page_analyses = analyses
-    return analyses
+    return [a.to_dict() for a in analyses]
 
 
 def create_investigation_queue(ctx: InvestigationContext,
@@ -208,16 +213,13 @@ def create_investigation_queue(ctx: InvestigationContext,
         return "No page analyses — run :web-analyze first."
 
     ctx.investigation_queue = web_analysis.InvestigationQueue()
-    items = page_ids or [a.get("page_id", "") for a in ctx.page_analyses[:20]]
+    by_id = {a.page_id: a for a in ctx.page_analyses}
+    items = page_ids or [a.page_id for a in ctx.page_analyses[:20]]
     for pid in items:
-        analysis = next((a for a in ctx.page_analyses if a.get("page_id") == pid), None)
+        analysis = by_id.get(pid)
         if analysis:
-            ctx.investigation_queue.add(web_analysis.InvestigationItem(
-                page_id=pid,
-                url=analysis.get("url", ""),
-                priority=analysis.get("priority", 0),
-                categories=analysis.get("categories", []),
-            ))
+            item = ctx.investigation_queue.add(pid, analysis.url)
+            item.analysis = analysis
     return f"Queue created with {len(ctx.investigation_queue.items)} items."
 
 
@@ -400,7 +402,7 @@ def export_full_report(ctx: InvestigationContext,
         report["modules"]["web_analysis"] = {
             "analyzed_pages": len(ctx.page_analyses),
             "interesting": sum(1 for a in ctx.page_analyses
-                               if a.get("priority", 0) > 50),
+                               if getattr(a, "priority", 0) > 50),
         }
 
     if ctx.atomic_repo is not None:

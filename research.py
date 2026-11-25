@@ -1081,7 +1081,10 @@ def classify_validation(kind: str, service: str, exit_code: int,
                 f"inconclusive Redis probe (exit {exit_code})")
 
     if kind == "anon-check" and svc == "ftp":
-        if "allowed" in out or "anonymous ftp login allowed" in out or "ftp-anon" in out and "allowed" in out:
+        if ("anonymous ftp login allowed" in out
+                or ("ftp-anon" in out and "allowed" in out)
+                or "230 login successful" in out
+                or "230 anonymous" in out):
             return (STATUS_CONFIRMED, "high", AUTH_ANONYMOUS,
                     "anonymous FTP login allowed")
         if "anonymous" in out and "denied" in out:

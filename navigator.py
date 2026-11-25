@@ -242,8 +242,8 @@ def hypotheses_to_annotations(hypotheses: list[dict],
         else:
             evidence_level = "unverified"
 
-        # find matching techniques
-        techniques = _CATEGORY_TECHNIQUE_MAP.get(category, [])
+        # find matching techniques (copy — never mutate the module-level dicts)
+        techniques = list(_CATEGORY_TECHNIQUE_MAP.get(category, []))
         product = service.split("/")[0] if "/" in service else service
         techniques.extend(_PRODUCT_TECHNIQUE_MAP.get(product.lower(), []))
 

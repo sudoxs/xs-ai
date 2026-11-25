@@ -40,15 +40,22 @@ SAFE_PREFIXES = (
     "ls ", "ls", "dir ", "id", "whoami", "hostname", "uname", "ifconfig",
     "ip addr", "ip route", "netstat", "ss ", "ps ", "env", "printenv",
     "echo ", "ping -c", "dig ", "nslookup ", "host ", "whois ",
-    "file ", "stat ", "wc ", "grep ", "find ", "which ", "type ",
+    "file ", "stat ", "wc ", "grep ", "which ", "type ",
     "dpkg -l", "rpm -qa", "apt list", "systemctl status",
     "service --status-all", "ss -tlnp", "netstat -tlnp",
 )
 
 LOW_RISK_PREFIXES = (
     "mkdir ", "touch ", "echo ", "cp ", "mv ", "chmod ",
-    "wget -O ", "curl -o ",
 )
+
+# `find` can RCE via -exec/-ok/-delete/-fprintf; checked below with a regex
+# instead of being on SAFE_PREFIXES.
+_FIND_DANGEROUS_RE = re.compile(r"\s-(?:exec|execdir|ok|okdir|delete|fprintf|fprint|fls|fls0)\b")
+
+# `wget -O`/`curl -o` with an output path can clobber arbitrary files; we
+# restrict them to stdout-only forms (`curl -s`, `wget -q`) which are already
+# on SAFE_PREFIXES.  Explicit `-O`/`-o` requires operator approval.
 
 
 @dataclass
@@ -321,10 +328,13 @@ def decide_next_action(
         raw = client.run_phase(session.phase, prompt, system=DECIDE_SYSTEM,
                                want_json=True)
     except Exception as exc:
+        # A transient model error must NOT silently end the loop. Return a
+        # retry-marker action; the loop treats consecutive errors as a stall.
+        state.step += 1
         return Action(
             step=state.step,
             phase=session.phase,
-            action_type="done",
+            action_type="retry",
             description=f"Model error: {exc}",
             error=str(exc)[:300],
             timestamp=_now(),
@@ -376,6 +386,13 @@ def _has_shell_redirect(cmd: str) -> bool:
     return bool(_SHELL_REDIRECT_RE.search(cmd))
 
 
+def _is_safe_find(sc: str) -> bool:
+    """`find ...` is safe only without -exec/-delete/-fprintf and friends."""
+    if not sc.startswith("find "):
+        return False
+    return _FIND_DANGEROUS_RE.search(" " + sc) is None
+
+
 def auto_approve(action: Action, level: int) -> bool:
     if level >= 3:
         return True
@@ -390,14 +407,18 @@ def auto_approve(action: Action, level: int) -> bool:
         sub_cmds = _extract_simple_commands(cmd)
         if not sub_cmds:
             return False
-        if level >= 1 and all(
-            any(sc.startswith(p) for p in SAFE_PREFIXES) for sc in sub_cmds
-        ):
+
+        def _is_safe(sc: str) -> bool:
+            if sc.startswith("find "):
+                return _is_safe_find(sc)
+            return any(sc.startswith(p) for p in SAFE_PREFIXES)
+
+        def _is_low_risk(sc: str) -> bool:
+            return _is_safe(sc) or any(sc.startswith(p) for p in LOW_RISK_PREFIXES)
+
+        if level >= 1 and all(_is_safe(sc) for sc in sub_cmds):
             return True
-        if level >= 2 and all(
-            any(sc.startswith(p) for p in SAFE_PREFIXES + LOW_RISK_PREFIXES)
-            for sc in sub_cmds
-        ):
+        if level >= 2 and all(_is_low_risk(sc) for sc in sub_cmds):
             return True
     return False
 
@@ -525,6 +546,12 @@ def run_agent_loop(
                 state.running = False
                 break
 
+            if action.action_type == "retry":
+                _cprint("yellow", f"  [Agent] {action.description} — retrying next step")
+                state.actions.append(action)
+                _save_log(state)
+                continue
+
             # command deduplication check
             if action.action_type == "command" and action.command:
                 norm = _normalize_command(action.command)
@@ -566,16 +593,13 @@ def run_agent_loop(
 
             if action.action_type == "command" and action.approved:
                 cmd = action.command.strip()
-                _PHASE_NAMES = {"recon", "enum", "access", "privesc", "discovery"}
-                if cmd.lower() in _PHASE_NAMES:
+                _VALID_PHASES = {"recon", "enum", "access", "privesc"}
+                if cmd.lower() in _VALID_PHASES:
                     _cprint("yellow", f"  [Agent] '{cmd}' is a phase, not a command — converting to set_phase")
                     action.action_type = "set_phase"
-                    if cmd.lower() in ("recon", "enum", "access", "privesc"):
-                        session.phase = cmd.lower()
-                        action.executed = True
-                        _cprint("green", f"  [Agent] Phase -> {cmd.lower()}")
-                    else:
-                        action.error = f"invalid phase: {cmd}"
+                    session.phase = cmd.lower()
+                    action.executed = True
+                    _cprint("green", f"  [Agent] Phase -> {cmd.lower()}")
                 elif not cmd or cmd.startswith(":"):
                     action.error = f"not a shell command: {cmd}"
                     _cprint("yellow", f"  [Agent] Skipping non-shell command: {cmd}")

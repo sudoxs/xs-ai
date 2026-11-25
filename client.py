@@ -1072,6 +1072,12 @@ def load_scope(path: str) -> set[str]:
 _SHELL_META_RE = re.compile(r"[;|&`$()><\n\r\\!{}]")
 
 
+def _fill_target(template: str, target: str) -> str:
+    """Substitute {target} in a template without .format() — so raw braces
+    elsewhere (e.g. `--script-args 'x={a}'`) don't crash with KeyError."""
+    return template.replace("{target}", target)
+
+
 def _sanitize_target(value: str) -> tuple[str, str]:
     """Validate a target value contains no shell metacharacters.
     Returns (cleaned_value, error_message).  Empty error means OK."""
@@ -1473,10 +1479,17 @@ class SSHConnection:
 
     def connect(self) -> tuple[bool, str]:
         self._clear_stale_socket()
+        # Pre-flight: password auth needs sshpass
+        if self.password and not self.key_file:
+            import shutil
+            if shutil.which("sshpass") is None:
+                return False, ("password auth requires sshpass (apt install sshpass), "
+                               "or use a key file instead")
         test_cmd = self._build_ssh_cmd("id 2>/dev/null || whoami")
         try:
             result = subprocess.run(
                 test_cmd, capture_output=True, text=True, timeout=15,
+                env=self._ssh_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 self._connected = True
@@ -1490,6 +1503,7 @@ class SSHConnection:
         try:
             result = subprocess.run(
                 ssh_cmd, capture_output=True, text=True, timeout=timeout,
+                env=self._ssh_env(),
             )
             out = result.stdout + ("\n" + result.stderr if result.stderr.strip() else "")
         except subprocess.TimeoutExpired:
@@ -1508,11 +1522,15 @@ class SSHConnection:
         return os.path.join(tempfile.gettempdir(), f"xsai-ssh-{tag}.sock")
 
     def _build_ssh_cmd(self, cmd: str) -> list[str]:
-        args = [
+        use_sshpass = bool(self.password) and not self.key_file
+        args: list[str] = []
+        if use_sshpass:
+            args += ["sshpass", "-e"]  # reads password from SSHPASS env var
+        args += [
             "ssh", "-T",  # no remote pty — stops remote commands mangling our TTY
             "-o", "StrictHostKeyChecking=yes",
             "-o", "ConnectTimeout=8",
-            "-o", "BatchMode=yes" if self.key_file else "BatchMode=no",
+            "-o", "BatchMode=yes" if (self.key_file or use_sshpass) else "BatchMode=no",
             "-o", "ControlMaster=auto",
             "-o", f"ControlPath={self._control_path()}",
             "-o", "ControlPersist=120s",
@@ -1520,8 +1538,17 @@ class SSHConnection:
         ]
         if self.key_file:
             args += ["-i", self.key_file]
+        if use_sshpass:
+            args += ["-o", "PubkeyAuthentication=no",
+                     "-o", "PreferredAuthentications=password"]
         args += [f"{self.username}@{self.host}", cmd]
         return args
+
+    def _ssh_env(self) -> dict:
+        env = dict(os.environ)
+        if self.password and not self.key_file:
+            env["SSHPASS"] = self.password
+        return env
 
     def _clear_stale_socket(self) -> None:
         """Remove a leftover control socket that has no live master behind it.
@@ -2382,7 +2409,7 @@ def _run_checks_parallel(checks: list[tuple[str, str]], session: Session,
     """Run independent checks concurrently after a single batch approval."""
     from concurrent.futures import ThreadPoolExecutor
 
-    cmds = [(title, tmpl.format(target=session.target)) for title, tmpl in checks]
+    cmds = [(title, _fill_target(tmpl, session.target)) for title, tmpl in checks]
     # re-test guard: drop checks already run successfully, unless redo is set
     if not redo:
         kept, skipped = [], 0
@@ -2442,7 +2469,7 @@ def run_auto_checks(checks: list[tuple[str, str]], session: Session,
         cprint("cyan", f"\n  Auto-enum: {len(checks)} checks available")
 
         for i, (title, cmd_template) in enumerate(checks, 1):
-            cmd = cmd_template.format(target=session.target)
+            cmd = _fill_target(cmd_template, session.target)
             cprint("cyan", f"\n  [{i}/{len(checks)}] {title}")
             prior = session.prior_run(cmd, successful_only=True)
             if prior and not redo:
@@ -2768,1206 +2795,1217 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         )
 
     while True:
-        label = session.phase
-        if session.ssh:
-            label += f"|ssh:{session.ssh.host}"
-        user_input = prompt_input(label)
+        try:
+            label = session.phase
+            if session.ssh:
+                label += f"|ssh:{session.ssh.host}"
+            user_input = prompt_input(label)
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        # --- meta commands ---
-        if user_input == ":quit":
-            if session.commands:
-                cprint("yellow", "Generating final report...")
-                path = generate_report(session, report_dir)
-                cprint("green", f"Report saved: {path}")
-            break
+            # --- meta commands ---
+            if user_input == ":quit":
+                if session.commands:
+                    cprint("yellow", "Generating final report...")
+                    path = generate_report(session, report_dir)
+                    cprint("green", f"Report saved: {path}")
+                break
 
-        if user_input == ":help":
-            show_help()
-            continue
+            if user_input == ":help":
+                show_help()
+                continue
 
-        if user_input == ":status":
-            show_status(session)
-            continue
+            if user_input == ":status":
+                show_status(session)
+                continue
 
-        if user_input.startswith(":phase"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2 and parts[1] in PHASES:
-                session.phase = parts[1]
-                cprint("green", f"  Phase -> {session.phase}")
-            else:
-                cprint("red", f"  Valid phases: {', '.join(PHASES)}")
-            continue
-
-        if user_input.startswith(":os"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2 and parts[1] in ("linux", "windows"):
-                session.target_os = parts[1]
-                cprint("green", f"  Target OS -> {session.target_os}")
-            else:
-                cprint("red", "  Usage: :os linux  or  :os windows")
-            continue
-
-        if user_input.startswith(":cred"):
-            parts = user_input.split(maxsplit=2)
-            if len(parts) >= 3:
-                session.credentials["username"] = parts[1]
-                session.credentials["password"] = parts[2]
-                cprint("green", f"  Credentials set for: {parts[1]}")
-            elif len(parts) == 2:
-                session.credentials["username"] = parts[1]
-                reset_terminal(flush=True)
-                pw = getpass.getpass("  Password: ")
-                session.credentials["password"] = pw
-                cprint("green", f"  Credentials set for: {parts[1]}")
-            else:
-                cprint("red", "  Usage: :cred <username> [password]")
-            continue
-
-        if user_input.startswith(":target"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                new_target, err = _sanitize_target(parts[1])
-                if err:
-                    cprint("red", f"  {err}")
-                    continue
-                session.target = new_target
-                ok, reason = guard.check(new_target)
-                if ok:
-                    cprint("green", f"  Target -> {session.target} (in scope)")
+            if user_input.startswith(":phase"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2 and parts[1] in PHASES:
+                    session.phase = parts[1]
+                    cprint("green", f"  Phase -> {session.phase}")
                 else:
-                    cprint("yellow", f"  Target -> {session.target}")
-                    cprint("magenta", f"  ⚠ {reason}")
-                    cprint("dim", f"    Authorize with: :scope add {new_target}")
-            continue
+                    cprint("red", f"  Valid phases: {', '.join(PHASES)}")
+                continue
 
-        if user_input.startswith(":scope"):
-            parts = user_input.split()
-            if len(parts) == 1 or parts[1] == "show":
-                cprint("cyan", f"  Scope: {guard.status()}")
-                cprint("dim", f"  Audit trail: {guard.audit_path}")
-            elif parts[1] == "add" and len(parts) >= 3:
-                for t in parts[2:]:
-                    guard.add(t)
-                    guard.audit("scope_add", t, "", "operator added target to scope")
-                cprint("green", f"  Added to scope. Now: {guard.status()}")
-            elif parts[1] == "clear":
-                guard.allowed.clear()
-                guard.configured = False
-                guard.audit("scope_clear", "", "", "operator cleared scope")
-                cprint("yellow", "  Scope cleared — execution is now blocked (fail-closed).")
-            else:
-                cprint("dim", "  Usage: :scope [show] | :scope add <target...> | :scope clear")
-            continue
+            if user_input.startswith(":os"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2 and parts[1] in ("linux", "windows"):
+                    session.target_os = parts[1]
+                    cprint("green", f"  Target OS -> {session.target_os}")
+                else:
+                    cprint("red", "  Usage: :os linux  or  :os windows")
+                continue
 
-        if user_input.startswith(":ssh-key"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                ssh_key_file = parts[1].strip()
-                cprint("green", f"  SSH key set: {ssh_key_file}")
-            continue
+            if user_input.startswith(":cred"):
+                parts = user_input.split(maxsplit=2)
+                if len(parts) >= 3:
+                    session.credentials["username"] = parts[1]
+                    session.credentials["password"] = parts[2]
+                    cprint("green", f"  Credentials set for: {parts[1]}")
+                elif len(parts) == 2:
+                    session.credentials["username"] = parts[1]
+                    reset_terminal(flush=True)
+                    pw = getpass.getpass("  Password: ")
+                    session.credentials["password"] = pw
+                    cprint("green", f"  Credentials set for: {parts[1]}")
+                else:
+                    cprint("red", "  Usage: :cred <username> [password]")
+                continue
 
-        if user_input.startswith(":ssh"):
-            parts = user_input.split(maxsplit=1)
-            ssh_user = session.credentials.get("username", "")
-            ssh_host = session.target
-            ssh_port = 22
+            if user_input.startswith(":target"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    new_target, err = _sanitize_target(parts[1])
+                    if err:
+                        cprint("red", f"  {err}")
+                        continue
+                    session.target = new_target
+                    ok, reason = guard.check(new_target)
+                    if ok:
+                        cprint("green", f"  Target -> {session.target} (in scope)")
+                    else:
+                        cprint("yellow", f"  Target -> {session.target}")
+                        cprint("magenta", f"  ⚠ {reason}")
+                        cprint("dim", f"    Authorize with: :scope add {new_target}")
+                continue
 
-            if len(parts) == 2:
-                spec = parts[1].strip()
-                if "@" in spec:
-                    ssh_user, rest = spec.split("@", 1)
-                    if ":" in rest:
-                        ssh_host, port_s = rest.rsplit(":", 1)
-                        try:
-                            ssh_port = int(port_s)
-                        except ValueError:
+            if user_input.startswith(":scope"):
+                parts = user_input.split()
+                if len(parts) == 1 or parts[1] == "show":
+                    cprint("cyan", f"  Scope: {guard.status()}")
+                    cprint("dim", f"  Audit trail: {guard.audit_path}")
+                elif parts[1] == "add" and len(parts) >= 3:
+                    for t in parts[2:]:
+                        guard.add(t)
+                        guard.audit("scope_add", t, "", "operator added target to scope")
+                    cprint("green", f"  Added to scope. Now: {guard.status()}")
+                elif parts[1] == "clear":
+                    guard.allowed.clear()
+                    guard.configured = False
+                    guard.audit("scope_clear", "", "", "operator cleared scope")
+                    cprint("yellow", "  Scope cleared — execution is now blocked (fail-closed).")
+                else:
+                    cprint("dim", "  Usage: :scope [show] | :scope add <target...> | :scope clear")
+                continue
+
+            if user_input.startswith(":ssh-key"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    ssh_key_file = parts[1].strip()
+                    cprint("green", f"  SSH key set: {ssh_key_file}")
+                continue
+
+            if user_input.startswith(":ssh"):
+                parts = user_input.split(maxsplit=1)
+                ssh_user = session.credentials.get("username", "")
+                ssh_host = session.target
+                ssh_port = 22
+
+                if len(parts) == 2:
+                    spec = parts[1].strip()
+                    if "@" in spec:
+                        ssh_user, rest = spec.split("@", 1)
+                        if ":" in rest:
+                            ssh_host, port_s = rest.rsplit(":", 1)
+                            try:
+                                ssh_port = int(port_s)
+                            except ValueError:
+                                ssh_host = rest
+                        else:
                             ssh_host = rest
                     else:
-                        ssh_host = rest
-                else:
-                    ssh_host = spec
+                        ssh_host = spec
 
-            if not ssh_user:
-                reset_terminal(flush=True)
-                ssh_user = input("  SSH username: ").strip()
-            if not ssh_user:
-                cprint("red", "  Username required.")
-                continue
+                if not ssh_user:
+                    reset_terminal(flush=True)
+                    ssh_user = input("  SSH username: ").strip()
+                if not ssh_user:
+                    cprint("red", "  Username required.")
+                    continue
 
-            ok_scope, reason = guard.check(ssh_host)
-            if not ok_scope:
-                guard.audit("blocked", ssh_host, "ssh connect", reason)
-                cprint("red", f"  [BLOCKED] {reason}")
-                cprint("dim", f"    Authorize with: :scope add {ssh_host}")
-                continue
-            cprint("dim", f"  Connecting SSH to {ssh_user}@{ssh_host}:{ssh_port}...")
-            conn = SSHConnection(
-                host=ssh_host, port=ssh_port, username=ssh_user,
-                key_file=ssh_key_file,
-                password=session.credentials.get("password"),
-            )
-            guard.audit("ssh_connect", ssh_host, f"{ssh_user}@{ssh_host}:{ssh_port}")
-            ok, info = conn.connect()
-            if ok:
-                session.ssh = conn
-                cprint("green", f"  SSH connected: {info}")
-                if "linux" in info.lower() or "uid=" in info:
-                    session.target_os = "linux"
-                elif "windows" in info.lower() or "\\" in info:
-                    session.target_os = "windows"
-            else:
-                cprint("red", f"  SSH failed: {info}")
-            continue
-
-        if user_input == ":disconnect":
-            if session.ssh:
-                session.ssh.close()
-            session.ssh = None
-            cprint("green", "  SSH disconnected.")
-            continue
-
-        if user_input == ":shell":
-            manual_shell_mode(session)
-            continue
-
-        if user_input.startswith(":run "):
-            cmd = user_input[5:].strip()
-            if cmd:
-                ok, reason = guard.check_free_command(cmd)
-                if not ok:
-                    guard.audit("blocked", session.target, cmd, reason)
+                ok_scope, reason = guard.check(ssh_host)
+                if not ok_scope:
+                    guard.audit("blocked", ssh_host, "ssh connect", reason)
                     cprint("red", f"  [BLOCKED] {reason}")
+                    cprint("dim", f"    Authorize with: :scope add {ssh_host}")
                     continue
-                guard.audit("execute", session.target, cmd, "local :run")
-                code, output = run_command(cmd)
-                print(output)
-                rec = CommandRecord(
-                    phase=session.phase, command=cmd,
-                    exit_code=code, output=output, useful=(code == 0 and bool(output.strip())),
-                    note="direct local run",
+                cprint("dim", f"  Connecting SSH to {ssh_user}@{ssh_host}:{ssh_port}...")
+                conn = SSHConnection(
+                    host=ssh_host, port=ssh_port, username=ssh_user,
+                    key_file=ssh_key_file,
+                    password=session.credentials.get("password"),
                 )
-                session.commands.append(rec)
-            continue
-
-        if user_input.startswith(":rrun "):
-            cmd = user_input[6:].strip()
-            if not session.ssh:
-                cprint("red", "  No SSH connection. Use :ssh first.")
-                continue
-            if cmd:
-                ok, reason = guard.check(session.ssh.host)
-                if not ok:
-                    guard.audit("blocked", session.ssh.host, cmd, reason)
-                    cprint("red", f"  [BLOCKED] {reason}")
-                    continue
-                guard.audit("execute", session.ssh.host, cmd, "remote :rrun")
-                cprint("dim", f"  Running on {session.ssh.label}: {cmd}")
-                code, output = session.ssh.run(cmd)
-                print(output)
-                rec = CommandRecord(
-                    phase=session.phase, command=cmd,
-                    exit_code=code, output=output,
-                    useful=(code == 0 and bool(output.strip())),
-                    note="direct remote run", remote=True,
-                )
-                session.commands.append(rec)
-            continue
-
-        if user_input == ":scan":
-            cmd = f"nmap -Pn -sV --version-light --top-ports 100 -T3 {session.target}"
-            _prior = session.prior_run(cmd, successful_only=True)
-            approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
-            if approval is not False:
-                cmd_to_run = approval if isinstance(approval, str) else cmd
-                cprint("dim", f"  Running: {cmd_to_run}")
-                code, output = guarded_run(cmd_to_run, timeout=180)
-                is_useful = code == 0 and len(output.strip()) > 10
-                rec = CommandRecord(
-                    phase="recon", command=cmd_to_run,
-                    exit_code=code, output=output, useful=is_useful, note="quick scan",
-                )
-                session.commands.append(rec)
-                print(output)
-            continue
-
-        if user_input == ":fullscan":
-            cmd = f"nmap -Pn -p- -T4 --min-rate 1000 {session.target}"
-            _prior = session.prior_run(cmd, successful_only=True)
-            approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
-            if approval is not False:
-                cmd_to_run = approval if isinstance(approval, str) else cmd
-                cprint("dim", f"  Running: {cmd_to_run}")
-                code, output = guarded_run(cmd_to_run, timeout=600)
-                is_useful = code == 0 and len(output.strip()) > 10
-                rec = CommandRecord(
-                    phase="recon", command=cmd_to_run,
-                    exit_code=code, output=output, useful=is_useful, note="full scan",
-                )
-                session.commands.append(rec)
-                print(output)
-            continue
-
-        if user_input.startswith(":svc"):
-            tokens = user_input.split()
-            if len(tokens) < 2:
-                cprint("red", "  Usage: :svc <port> [redo]  (e.g. :svc 445)")
-                cprint("dim", f"  Built-in ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
-                cprint("dim", "  Any other port -> AI generates dynamic checks from the banner.")
-                cprint("dim", "  Add 'redo' to re-run checks already done earlier.")
-                continue
-            port = tokens[1].strip()
-            svc_redo = "redo" in tokens[2:]
-            if port in SERVICE_PORT_MAP:
-                checks = SERVICE_PORT_MAP[port]
-                cprint("cyan", f"  Service enum for port {port}:")
-                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
-            else:
-                cprint("yellow", f"  No built-in checklist for port {port} — asking AI for dynamic checks.")
-                bcmd = f"nmap -Pn -sV -p{port} {session.target}"
-                approval = approve(bcmd)
-                if approval is False:
-                    continue
-                bcmd_run = approval if isinstance(approval, str) else bcmd
-                cprint("dim", f"  Running: {bcmd_run}")
-                code, banner = guarded_run(bcmd_run, timeout=120)
-                session.commands.append(CommandRecord(
-                    phase=session.phase, command=bcmd_run, exit_code=code,
-                    output=banner, useful=(code == 0 and bool(banner.strip())),
-                    note=f"banner grab port {port}",
-                ))
-                print(banner)
-                cprint("dim", "  Generating service-specific checks...")
-                checks = generate_dynamic_checks(
-                    client, session, port, distill_output(bcmd_run, banner),
-                )
-                if not checks:
-                    cprint("red", "  AI produced no usable checks for this service.")
-                    continue
-                cprint("cyan", f"  AI proposed {len(checks)} checks for port {port}:")
-                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
-            continue
-
-        if user_input == ":ports":
-            cprint("dim", "  Scanning for open ports...")
-            ports_cmd = f"nmap -Pn -n --top-ports 1000 -T4 --open {session.target}"
-            detected: list[str] = []
-            output = ""
-            # recon robustness: the first scan sometimes returns nothing
-            # (race/timing); retry+verify before concluding there's nothing.
-            for attempt in range(3):
-                code, output = guarded_run(ports_cmd, timeout=180)
-                if output.startswith("[BLOCKED]"):
-                    break
-                detected = [m.group(1) for line in output.splitlines()
-                            if (m := re.match(r"\s*(\d+)/tcp\s+open", line))]
-                if detected:
-                    break
-                if attempt < 2:
-                    cprint("dim", f"  No ports yet — retrying ({attempt + 2}/3)...")
-                    time.sleep(2)
-            if output.startswith("[BLOCKED]"):
-                continue
-            if not detected:
-                cprint("yellow", "  No open TCP ports detected after 3 attempts.")
-                continue
-            cprint("green", f"  Open ports: {', '.join(detected)}")
-            has_checks = [p for p in detected if p in SERVICE_PORT_MAP]
-            if has_checks:
-                cprint("cyan", "  Service-specific checks available for:")
-                for p in has_checks:
-                    checks = SERVICE_PORT_MAP[p]
-                    cprint("green", f"    Port {p}: {len(checks)} checks  → :svc {p}")
-            else:
-                cprint("dim", "  No service-specific checks for detected ports.")
-            rec = CommandRecord(
-                phase="recon", command=ports_cmd,
-                exit_code=code, output=output, useful=bool(detected), note="port detection",
-            )
-            session.commands.append(rec)
-            # surface product-associated ports the operator should also research
-            if research is not None:
-                for fpp in research.parse_fingerprints(output):
-                    extra = [p for p in research.associated_ports(fpp.product_id)
-                             if p not in detected]
-                    if extra:
-                        cprint("magenta", f"  {fpp.product_id} detected — also check port(s) "
-                                          f"{', '.join(extra)} (:research {fpp.port} auto-scans them)")
-            continue
-
-        if user_input == ":tools":
-            relevant = get_relevant_tools(session)
-            if not relevant:
-                cprint("dim", "  No tool suggestions for current phase/OS.")
-                cprint("dim", "  Set :os and :phase first, or try from privesc phase.")
-                continue
-            cprint("cyan", f"\n  Tool suggestions for {session.phase} ({session.target_os or 'any OS'}):\n")
-            for i, tool in enumerate(relevant, 1):
-                cprint("yellow", f"  {i}. {tool['name']}")
-                cprint("dim",    f"     {tool['description']}")
-                if tool.get("prereq"):
-                    cprint("dim", f"     Prereq: {tool['prereq']}")
-                cprint("dim",    f"     Check:    {tool['condition']}")
-                cprint("green",  f"     Download: {tool['download']}")
-                cprint("green",  f"     Usage:    {tool['usage']}")
-                print()
-            cprint("dim", "  These tools need manual download. xs-ai checks conditions only.")
-            cprint("dim", "  Run the 'Check' command via :run or :rrun to verify prerequisites.")
-            continue
-
-        if user_input == ":install":
-            tools_to_check = list(TOOL_INSTALL_MAP.keys())
-            cprint("cyan", f"\n  Checking {len(tools_to_check)} tools...")
-            status = check_and_install_tools(tools_to_check)
-            installed = [t for t, ok in status.items() if ok]
-            missing = [t for t, ok in status.items() if not ok]
-            cprint("green", f"  Installed ({len(installed)}): {', '.join(installed[:15])}{'...' if len(installed) > 15 else ''}")
-            if missing:
-                cprint("yellow", f"  Missing ({len(missing)}): {', '.join(missing)}")
-            else:
-                cprint("green", "  All tools installed!")
-            continue
-
-        if user_input.startswith(":memory"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2 and parts[1] == "show":
-                mem = generate_project_memory(session)
-                print(mem)
-            else:
-                mem_path = save_project_memory(session)
-                cprint("green", f"  Project memory saved: {mem_path}")
-                cprint("dim", "  AI will load this automatically on next startup.")
-            continue
-
-        if user_input.startswith(":roles"):
-            parts = user_input.split()
-            if len(parts) == 1:
-                cprint("cyan", "  Role mapping (phase -> model):")
-                print(client.roles.summary())
-                cprint("dim", f"  Default planner : {client.planner_model}")
-                cprint("dim", f"  Default analyzer: {client.executor_model}")
-            elif len(parts) == 2 and parts[1] == "save":
-                save_roles_file(client.roles)
-                cprint("green", "  Roles saved to roles.json")
-            elif len(parts) == 2 and parts[1] == "clear":
-                client.roles = RoleMap()
-                cprint("green", "  All role overrides cleared (using defaults)")
-            elif len(parts) >= 3 and parts[1] == "rm":
-                role = parts[2]
-                if client.roles.remove_role(role):
-                    cprint("green", f"  Removed role override: {role}")
+                guard.audit("ssh_connect", ssh_host, f"{ssh_user}@{ssh_host}:{ssh_port}")
+                ok, info = conn.connect()
+                if ok:
+                    session.ssh = conn
+                    cprint("green", f"  SSH connected: {info}")
+                    if "linux" in info.lower() or "uid=" in info:
+                        session.target_os = "linux"
+                    elif "windows" in info.lower() or "\\" in info:
+                        session.target_os = "windows"
                 else:
-                    cprint("red", f"  No override for: {role}")
-            elif len(parts) >= 3:
-                role, model = parts[1], " ".join(parts[2:])
-                client.roles.set_role(role, model)
-                cprint("green", f"  {role} -> {model}")
-            else:
-                cprint("dim", "  Usage: :roles [<role> <model>] [save|clear|rm <role>]")
-            continue
-
-        if user_input == ":models":
-            reg = getattr(client, "registry", None)
-            if reg is None:
-                cprint("dim", "  Single-backend mode (no model registry).")
-                cprint("dim", f"    planner : {getattr(client, 'planner_model', '?')}")
-                cprint("dim", f"    analyzer: {getattr(client, 'executor_model', '?')}")
-                cprint("dim", "    Add a models.json to enable multi-model routing (see README).")
-            else:
-                cprint("cyan", "  Model registry:")
-                print(reg.status())
-            continue
-
-        if user_input.startswith(":auto"):
-            auto_redo = "redo" in user_input.split()[1:]
-            if session.phase == "recon":
-                checks = RECON_CHECKS
-            elif session.phase == "enum":
-                checks = ENUM_WINDOWS_CHECKS if session.target_os == "windows" else ENUM_LINUX_CHECKS
-            elif session.phase == "privesc":
-                if session.target_os == "windows":
-                    checks = PRIVESC_WINDOWS_CHECKS
-                else:
-                    checks = PRIVESC_LINUX_CHECKS
-            else:
-                cprint("red", "  Auto-enum available for: recon, enum, privesc")
-                continue
-            run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=auto_redo)
-            continue
-
-        if user_input.startswith(":research"):
-            if research is None or research_engine is None:
-                cprint("red", "  Research engine unavailable (research.py not found).")
-                continue
-            tokens = user_input.split()
-            if len(tokens) < 2:
-                cprint("red", "  Usage: :research <port>  (e.g. :research 8080)")
-                continue
-            port = tokens[1].strip()
-            nmap_out = "\n".join(r.output for r in session.commands
-                                 if "nmap" in r.command and r.useful)
-            evidence_parts = [nmap_out]
-            fp = research.fingerprint_for_port(port, nmap_out)
-            # deep service/version grab (-sCV) if we have no product yet
-            if not fp.version and not fp.product:
-                bcmd = f"nmap -sCV -Pn -n -p{port} {session.target}"
-                cprint("yellow", f"  No fingerprint for port {port} yet — deep service scan?")
-                approval = approve(bcmd)
-                if approval is not False:
-                    cmd_to_run = approval if isinstance(approval, str) else bcmd
-                    cprint("dim", f"  Running: {cmd_to_run}")
-                    code, out = guarded_run(cmd_to_run, timeout=180)
-                    if code == 0:
-                        session.commands.append(CommandRecord(
-                            phase=session.phase, command=cmd_to_run, exit_code=code,
-                            output=out, useful=True, note=f"deep scan port {port}"))
-                        evidence_parts.append(out)
-                        fp = research.fingerprint_for_port(port, out)
-            # product-associated ports: deep-scan any that aren't yet richly
-            # fingerprinted (a bare "open" from :ports isn't enough — we need the
-            # -sCV banner, e.g. Splunk 8089's "free license; remote login disabled")
-            assoc = research.associated_ports(fp.product_id)
-            deeply_known = {f.port for f in research.parse_fingerprints("\n".join(evidence_parts))
-                            if f.product or f.version}
-            missing = [p for p in assoc if p != str(port) and p not in deeply_known]
-            if missing:
-                acmd = f"nmap -sCV -Pn -n -p{','.join(missing)} {session.target}"
-                cprint("cyan", f"  {fp.product_id} also uses port(s) {', '.join(missing)} — deep scan them?")
-                approval = approve(acmd)
-                if approval is not False:
-                    cmd_to_run = approval if isinstance(approval, str) else acmd
-                    cprint("dim", f"  Running: {cmd_to_run}")
-                    code, out = guarded_run(cmd_to_run, timeout=180)
-                    if code == 0 and out.strip():
-                        session.commands.append(CommandRecord(
-                            phase=session.phase, command=cmd_to_run, exit_code=code,
-                            output=out, useful=True, note=f"associated ports {','.join(missing)}"))
-                        evidence_parts.append(out)
-            evidence_text = "\n".join(evidence_parts)
-            # a free-license / unauthenticated instance of a known product is a
-            # finding in its own right (high), not just a log line
-            ev_low = evidence_text.lower()
-            if fp.product_id and ("free license" in ev_low or "remote login disabled" in ev_low
-                                  or "401 unauthorized" in ev_low):
-                finding = (f"[{fp.product_id}] free-license / unauthenticated instance exposed "
-                           f"on {session.target} — high severity (feature-abuse path likely)")
-                if finding not in session.findings:
-                    session.findings.append(finding)
-                    cprint("green", f"  FINDING: {finding}")
-            cprint("cyan", f"  Researching {fp.label()} on {session.target} "
-                           f"(online={'yes' if online else 'no'})...")
-            start = len(session.hypotheses) + 1
-            try:
-                hyps = research_engine.investigate(fp, session.target, client=client,
-                                                   start_idx=start, evidence_text=evidence_text)
-            except Exception as exc:
-                cprint("red", f"  Research error: {exc}")
-                continue
-            if not hyps:
-                cprint("dim", "  No hypotheses — no leads for this service "
-                              "(add a knowledge/ module or try --online).")
-                continue
-            new_findings = 0
-            for h in hyps:
-                session.hypotheses.append(h.to_dict())
-                print_hypothesis(h)
-                # Detection-time finding: a well-supported high/critical hypothesis
-                # is recorded as a finding now (before any :validate), so :findings
-                # reflects the risk. :validate later upgrades status to confirmed.
-                if (h.severity in ("high", "critical")
-                        and h.status in (research.STATUS_SUSPECTED, research.STATUS_CONFIRMED)):
-                    finding = (f"[{h.id}] {h.severity.upper()} / {h.status} — "
-                               f"{h.observation} ({h.service})")
-                    if finding not in session.findings:
-                        session.findings.append(finding)
-                        new_findings += 1
-            cprint("dim", f"  {len(hyps)} hypotheses recorded — see :hypotheses.")
-            if new_findings:
-                cprint("green", f"  {new_findings} finding(s) recorded — see :findings "
-                                f"(validate to confirm).")
-            tech = next((h for h in hyps if h.category == "technique"
-                         and (h.validation_hint or {}).get("validate_commands")), None)
-            if tech:
-                cprint("cyan", f"  Next: :validate {tech.id} to run safe checks; then "
-                               f":phase access → :validate {tech.id} for full exploit steps.")
-            continue
-
-        if user_input.startswith(":validate"):
-            if research is None:
-                cprint("red", "  Research engine unavailable (research.py not found).")
-                continue
-            tokens = user_input.split()
-            if len(tokens) < 2:
-                cprint("red", "  Usage: :validate <hypothesis-id>  (e.g. :validate H001)")
-                continue
-            hid = tokens[1].strip().upper()
-            hyp = next((h for h in session.hypotheses if h.get("id", "").upper() == hid), None)
-            if not hyp:
-                cprint("red", f"  No hypothesis {hid}. Use :hypotheses to list them.")
+                    cprint("red", f"  SSH failed: {info}")
                 continue
 
-            # --- technique hypotheses: multi-step safe validation + phase-gated exploit ---
-            vhint = hyp.get("validation_hint", {}) or {}
-            if hyp.get("category") == "technique" and vhint.get("validate_commands"):
-                used = cred_used.get(hid, 0)
-                if used >= cred_attempts:
-                    cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}).")
-                    continue
-                user = session.credentials.get("username") or vhint.get("default_credential", {}).get("user", "admin")
-                pw = session.credentials.get("password") or vhint.get("default_credential", {}).get("pass", "changeme")
-                plan = research.technique_validation_plan(hyp, session.target, user, pw)
-                cprint("cyan", f"  Validating {hid} — {len(plan)} safe read-only checks "
-                               f"(attempt {used + 1}/{cred_attempts}):")
-                results, aborted = [], False
-                for step in plan:
-                    approval = approve(step["cmd"], warn=step["desc"])
-                    if approval is False:
-                        cprint("dim", "  Skipped this check.")
-                        results.append({**step, "code": 1, "output": ""})
+            if user_input == ":disconnect":
+                if session.ssh:
+                    session.ssh.close()
+                session.ssh = None
+                cprint("green", "  SSH disconnected.")
+                continue
+
+            if user_input == ":shell":
+                manual_shell_mode(session)
+                continue
+
+            if user_input.startswith(":run "):
+                cmd = user_input[5:].strip()
+                if cmd:
+                    ok, reason = guard.check_free_command(cmd)
+                    if not ok:
+                        guard.audit("blocked", session.target, cmd, reason)
+                        cprint("red", f"  [BLOCKED] {reason}")
                         continue
-                    run_cmd = approval if isinstance(approval, str) else step["cmd"]
-                    code, out = guarded_run(run_cmd, timeout=60)
-                    if out.startswith("[BLOCKED]"):
-                        aborted = True
-                        break
-                    guard.audit("validate", session.target, run_cmd, f"technique {hid}")
-                    cprint("dim", f"    {step['desc']}: {out.strip()[:80]}")
-                    results.append({**step, "code": code, "output": out})
-                if aborted:
+                    guard.audit("execute", session.target, cmd, "local :run")
+                    code, output = run_command(cmd)
+                    print(output)
+                    rec = CommandRecord(
+                        phase=session.phase, command=cmd,
+                        exit_code=code, output=output, useful=(code == 0 and bool(output.strip())),
+                        note="direct local run",
+                    )
+                    session.commands.append(rec)
+                continue
+
+            if user_input.startswith(":rrun "):
+                cmd = user_input[6:].strip()
+                if not session.ssh:
+                    cprint("red", "  No SSH connection. Use :ssh first.")
                     continue
-                cred_used[hid] = used + 1
-                ok, msg, info = research.eval_technique_validation(results)
-                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                hyp["status"] = research.STATUS_CONFIRMED if ok else hyp.get("status")
-                if ok:
-                    hyp["confidence"] = "high"
-                hyp.setdefault("evidence", []).append(
-                    f"[validate {ts}] {msg} (license={info.get('license','?')})")
-                cprint("green" if ok else "yellow", f"  -> {msg}  [license={info.get('license','?')}]")
-                if ok:
-                    finding = f"[{hid}] VALIDATED: {hyp.get('observation','')} ({session.target})"
+                if cmd:
+                    ok, reason = guard.check(session.ssh.host)
+                    if not ok:
+                        guard.audit("blocked", session.ssh.host, cmd, reason)
+                        cprint("red", f"  [BLOCKED] {reason}")
+                        continue
+                    guard.audit("execute", session.ssh.host, cmd, "remote :rrun")
+                    cprint("dim", f"  Running on {session.ssh.label}: {cmd}")
+                    code, output = session.ssh.run(cmd)
+                    print(output)
+                    rec = CommandRecord(
+                        phase=session.phase, command=cmd,
+                        exit_code=code, output=output,
+                        useful=(code == 0 and bool(output.strip())),
+                        note="direct remote run", remote=True,
+                    )
+                    session.commands.append(rec)
+                continue
+
+            if user_input == ":scan":
+                cmd = f"nmap -Pn -sV --version-light --top-ports 100 -T3 {session.target}"
+                _prior = session.prior_run(cmd, successful_only=True)
+                approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
+                if approval is not False:
+                    cmd_to_run = approval if isinstance(approval, str) else cmd
+                    cprint("dim", f"  Running: {cmd_to_run}")
+                    code, output = guarded_run(cmd_to_run, timeout=180)
+                    is_useful = code == 0 and len(output.strip()) > 10
+                    rec = CommandRecord(
+                        phase="recon", command=cmd_to_run,
+                        exit_code=code, output=output, useful=is_useful, note="quick scan",
+                    )
+                    session.commands.append(rec)
+                    print(output)
+                continue
+
+            if user_input == ":fullscan":
+                cmd = f"nmap -Pn -p- -T4 --min-rate 1000 {session.target}"
+                _prior = session.prior_run(cmd, successful_only=True)
+                approval = approve(cmd, warn=prior_warning(_prior) if _prior else "")
+                if approval is not False:
+                    cmd_to_run = approval if isinstance(approval, str) else cmd
+                    cprint("dim", f"  Running: {cmd_to_run}")
+                    code, output = guarded_run(cmd_to_run, timeout=600)
+                    is_useful = code == 0 and len(output.strip()) > 10
+                    rec = CommandRecord(
+                        phase="recon", command=cmd_to_run,
+                        exit_code=code, output=output, useful=is_useful, note="full scan",
+                    )
+                    session.commands.append(rec)
+                    print(output)
+                continue
+
+            if user_input.startswith(":svc"):
+                tokens = user_input.split()
+                if len(tokens) < 2:
+                    cprint("red", "  Usage: :svc <port> [redo]  (e.g. :svc 445)")
+                    cprint("dim", f"  Built-in ports: {', '.join(sorted(SERVICE_PORT_MAP.keys(), key=int))}")
+                    cprint("dim", "  Any other port -> AI generates dynamic checks from the banner.")
+                    cprint("dim", "  Add 'redo' to re-run checks already done earlier.")
+                    continue
+                port = tokens[1].strip()
+                svc_redo = "redo" in tokens[2:]
+                if port in SERVICE_PORT_MAP:
+                    checks = SERVICE_PORT_MAP[port]
+                    cprint("cyan", f"  Service enum for port {port}:")
+                    run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
+                else:
+                    cprint("yellow", f"  No built-in checklist for port {port} — asking AI for dynamic checks.")
+                    bcmd = f"nmap -Pn -sV -p{port} {session.target}"
+                    approval = approve(bcmd)
+                    if approval is False:
+                        continue
+                    bcmd_run = approval if isinstance(approval, str) else bcmd
+                    cprint("dim", f"  Running: {bcmd_run}")
+                    code, banner = guarded_run(bcmd_run, timeout=120)
+                    session.commands.append(CommandRecord(
+                        phase=session.phase, command=bcmd_run, exit_code=code,
+                        output=banner, useful=(code == 0 and bool(banner.strip())),
+                        note=f"banner grab port {port}",
+                    ))
+                    print(banner)
+                    cprint("dim", "  Generating service-specific checks...")
+                    checks = generate_dynamic_checks(
+                        client, session, port, distill_output(bcmd_run, banner),
+                    )
+                    if not checks:
+                        cprint("red", "  AI produced no usable checks for this service.")
+                        continue
+                    cprint("cyan", f"  AI proposed {len(checks)} checks for port {port}:")
+                    run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=svc_redo)
+                continue
+
+            if user_input == ":ports":
+                cprint("dim", "  Scanning for open ports...")
+                ports_cmd = f"nmap -Pn -n --top-ports 1000 -T4 --open {session.target}"
+                detected: list[str] = []
+                output = ""
+                # recon robustness: the first scan sometimes returns nothing
+                # (race/timing); retry+verify before concluding there's nothing.
+                for attempt in range(3):
+                    code, output = guarded_run(ports_cmd, timeout=180)
+                    if output.startswith("[BLOCKED]"):
+                        break
+                    detected = [m.group(1) for line in output.splitlines()
+                                if (m := re.match(r"\s*(\d+)/tcp\s+open", line))]
+                    if detected:
+                        break
+                    if attempt < 2:
+                        cprint("dim", f"  No ports yet — retrying ({attempt + 2}/3)...")
+                        time.sleep(2)
+                if output.startswith("[BLOCKED]"):
+                    continue
+                if not detected:
+                    cprint("yellow", "  No open TCP ports detected after 3 attempts.")
+                    continue
+                cprint("green", f"  Open ports: {', '.join(detected)}")
+                has_checks = [p for p in detected if p in SERVICE_PORT_MAP]
+                if has_checks:
+                    cprint("cyan", "  Service-specific checks available for:")
+                    for p in has_checks:
+                        checks = SERVICE_PORT_MAP[p]
+                        cprint("green", f"    Port {p}: {len(checks)} checks  → :svc {p}")
+                else:
+                    cprint("dim", "  No service-specific checks for detected ports.")
+                rec = CommandRecord(
+                    phase="recon", command=ports_cmd,
+                    exit_code=code, output=output, useful=bool(detected), note="port detection",
+                )
+                session.commands.append(rec)
+                # surface product-associated ports the operator should also research
+                if research is not None:
+                    for fpp in research.parse_fingerprints(output):
+                        extra = [p for p in research.associated_ports(fpp.product_id)
+                                 if p not in detected]
+                        if extra:
+                            cprint("magenta", f"  {fpp.product_id} detected — also check port(s) "
+                                              f"{', '.join(extra)} (:research {fpp.port} auto-scans them)")
+                continue
+
+            if user_input == ":tools":
+                relevant = get_relevant_tools(session)
+                if not relevant:
+                    cprint("dim", "  No tool suggestions for current phase/OS.")
+                    cprint("dim", "  Set :os and :phase first, or try from privesc phase.")
+                    continue
+                cprint("cyan", f"\n  Tool suggestions for {session.phase} ({session.target_os or 'any OS'}):\n")
+                for i, tool in enumerate(relevant, 1):
+                    cprint("yellow", f"  {i}. {tool['name']}")
+                    cprint("dim",    f"     {tool['description']}")
+                    if tool.get("prereq"):
+                        cprint("dim", f"     Prereq: {tool['prereq']}")
+                    cprint("dim",    f"     Check:    {tool['condition']}")
+                    cprint("green",  f"     Download: {tool['download']}")
+                    cprint("green",  f"     Usage:    {tool['usage']}")
+                    print()
+                cprint("dim", "  These tools need manual download. xs-ai checks conditions only.")
+                cprint("dim", "  Run the 'Check' command via :run or :rrun to verify prerequisites.")
+                continue
+
+            if user_input == ":install":
+                tools_to_check = list(TOOL_INSTALL_MAP.keys())
+                cprint("cyan", f"\n  Checking {len(tools_to_check)} tools...")
+                status = check_and_install_tools(tools_to_check)
+                installed = [t for t, ok in status.items() if ok]
+                missing = [t for t, ok in status.items() if not ok]
+                cprint("green", f"  Installed ({len(installed)}): {', '.join(installed[:15])}{'...' if len(installed) > 15 else ''}")
+                if missing:
+                    cprint("yellow", f"  Missing ({len(missing)}): {', '.join(missing)}")
+                else:
+                    cprint("green", "  All tools installed!")
+                continue
+
+            if user_input.startswith(":memory"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2 and parts[1] == "show":
+                    mem = generate_project_memory(session)
+                    print(mem)
+                else:
+                    mem_path = save_project_memory(session)
+                    cprint("green", f"  Project memory saved: {mem_path}")
+                    cprint("dim", "  AI will load this automatically on next startup.")
+                continue
+
+            if user_input.startswith(":roles"):
+                parts = user_input.split()
+                if len(parts) == 1:
+                    cprint("cyan", "  Role mapping (phase -> model):")
+                    print(client.roles.summary())
+                    cprint("dim", f"  Default planner : {client.planner_model}")
+                    cprint("dim", f"  Default analyzer: {client.executor_model}")
+                elif len(parts) == 2 and parts[1] == "save":
+                    save_roles_file(client.roles)
+                    cprint("green", "  Roles saved to roles.json")
+                elif len(parts) == 2 and parts[1] == "clear":
+                    client.roles = RoleMap()
+                    cprint("green", "  All role overrides cleared (using defaults)")
+                elif len(parts) >= 3 and parts[1] == "rm":
+                    role = parts[2]
+                    if client.roles.remove_role(role):
+                        cprint("green", f"  Removed role override: {role}")
+                    else:
+                        cprint("red", f"  No override for: {role}")
+                elif len(parts) >= 3:
+                    role, model = parts[1], " ".join(parts[2:])
+                    client.roles.set_role(role, model)
+                    cprint("green", f"  {role} -> {model}")
+                else:
+                    cprint("dim", "  Usage: :roles [<role> <model>] [save|clear|rm <role>]")
+                continue
+
+            if user_input == ":models":
+                reg = getattr(client, "registry", None)
+                if reg is None:
+                    cprint("dim", "  Single-backend mode (no model registry).")
+                    cprint("dim", f"    planner : {getattr(client, 'planner_model', '?')}")
+                    cprint("dim", f"    analyzer: {getattr(client, 'executor_model', '?')}")
+                    cprint("dim", "    Add a models.json to enable multi-model routing (see README).")
+                else:
+                    cprint("cyan", "  Model registry:")
+                    print(reg.status())
+                continue
+
+            if user_input.startswith(":auto"):
+                auto_redo = "redo" in user_input.split()[1:]
+                if session.phase == "recon":
+                    checks = RECON_CHECKS
+                elif session.phase == "enum":
+                    checks = ENUM_WINDOWS_CHECKS if session.target_os == "windows" else ENUM_LINUX_CHECKS
+                elif session.phase == "privesc":
+                    if session.target_os == "windows":
+                        checks = PRIVESC_WINDOWS_CHECKS
+                    else:
+                        checks = PRIVESC_LINUX_CHECKS
+                else:
+                    cprint("red", "  Auto-enum available for: recon, enum, privesc")
+                    continue
+                run_auto_checks(checks, session, client, execute_cmd, parallel=parallel, redo=auto_redo)
+                continue
+
+            if user_input.startswith(":research"):
+                if research is None or research_engine is None:
+                    cprint("red", "  Research engine unavailable (research.py not found).")
+                    continue
+                tokens = user_input.split()
+                if len(tokens) < 2:
+                    cprint("red", "  Usage: :research <port>  (e.g. :research 8080)")
+                    continue
+                port = tokens[1].strip()
+                nmap_out = "\n".join(r.output for r in session.commands
+                                     if "nmap" in r.command and r.useful)
+                evidence_parts = [nmap_out]
+                fp = research.fingerprint_for_port(port, nmap_out)
+                # deep service/version grab (-sCV) if we have no product yet
+                if not fp.version and not fp.product:
+                    bcmd = f"nmap -sCV -Pn -n -p{port} {session.target}"
+                    cprint("yellow", f"  No fingerprint for port {port} yet — deep service scan?")
+                    approval = approve(bcmd)
+                    if approval is not False:
+                        cmd_to_run = approval if isinstance(approval, str) else bcmd
+                        cprint("dim", f"  Running: {cmd_to_run}")
+                        code, out = guarded_run(cmd_to_run, timeout=180)
+                        if code == 0:
+                            session.commands.append(CommandRecord(
+                                phase=session.phase, command=cmd_to_run, exit_code=code,
+                                output=out, useful=True, note=f"deep scan port {port}"))
+                            evidence_parts.append(out)
+                            fp = research.fingerprint_for_port(port, out)
+                # product-associated ports: deep-scan any that aren't yet richly
+                # fingerprinted (a bare "open" from :ports isn't enough — we need the
+                # -sCV banner, e.g. Splunk 8089's "free license; remote login disabled")
+                assoc = research.associated_ports(fp.product_id)
+                deeply_known = {f.port for f in research.parse_fingerprints("\n".join(evidence_parts))
+                                if f.product or f.version}
+                missing = [p for p in assoc if p != str(port) and p not in deeply_known]
+                if missing:
+                    acmd = f"nmap -sCV -Pn -n -p{','.join(missing)} {session.target}"
+                    cprint("cyan", f"  {fp.product_id} also uses port(s) {', '.join(missing)} — deep scan them?")
+                    approval = approve(acmd)
+                    if approval is not False:
+                        cmd_to_run = approval if isinstance(approval, str) else acmd
+                        cprint("dim", f"  Running: {cmd_to_run}")
+                        code, out = guarded_run(cmd_to_run, timeout=180)
+                        if code == 0 and out.strip():
+                            session.commands.append(CommandRecord(
+                                phase=session.phase, command=cmd_to_run, exit_code=code,
+                                output=out, useful=True, note=f"associated ports {','.join(missing)}"))
+                            evidence_parts.append(out)
+                evidence_text = "\n".join(evidence_parts)
+                # a free-license / unauthenticated instance of a known product is a
+                # finding in its own right (high), not just a log line
+                ev_low = evidence_text.lower()
+                if fp.product_id and ("free license" in ev_low or "remote login disabled" in ev_low
+                                      or "401 unauthorized" in ev_low):
+                    finding = (f"[{fp.product_id}] free-license / unauthenticated instance exposed "
+                               f"on {session.target} — high severity (feature-abuse path likely)")
                     if finding not in session.findings:
                         session.findings.append(finding)
                         cprint("green", f"  FINDING: {finding}")
-                # exploit steps are access-phase only
-                if ok and session.phase == "access":
-                    reset_terminal(flush=True)
-                    lhost = input("  LHOST (your listener IP): ").strip() or "{lhost}"
-                    reset_terminal(flush=True)
-                    lport = input("  LPORT [4444]: ").strip() or "4444"
-                    steps = research.technique_exploit_steps(
-                        hyp, session.target, lhost, lport, user, pw)
-                    cprint("magenta", f"\n  Exploit steps for {hid} (operator-executed; authorized scope only):")
-                    for n, s in enumerate(steps, 1):
-                        print(f"  --- step {n} ---")
-                        print("  " + s.replace("\n", "\n  "))
-                    guard.audit("exploit_shown", session.target, hid, "technique exploit steps displayed")
-                elif ok:
-                    cprint("dim", "  Switch to :phase access and re-run "
-                                  f":validate {hid} to see the full exploit steps.")
-                continue
-
-            cmd, kind = research.build_validation(hyp, session.target)
-            if cmd is None:
-                cprint("yellow", f"  {kind}")
-                continue
-            used = cred_used.get(hid, 0)
-            if used >= cred_attempts:
-                cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}). "
-                              f"Stopping — no brute-force.")
-                continue
-            svc = (hyp.get("validation_hint", {}) or {}).get("service", "")
-            cprint("cyan", f"  Validation for {hid} ({kind}) — single non-invasive check, "
-                           f"attempt {used + 1}/{cred_attempts}")
-            approval = approve(cmd)  # operator approval + (via guarded_run) scope check
-            if approval is False:
-                cprint("dim", "  Skipped.")
-                continue
-            cmd_to_run = approval if isinstance(approval, str) else cmd
-            if cred_delay and used > 0:
-                time.sleep(cred_delay)
-            code, output = guarded_run(cmd_to_run, timeout=60)
-            if output.startswith("[BLOCKED]"):
-                continue  # scope guard already reported + audited
-            cred_used[hid] = used + 1
-            guard.audit("validate", session.target, cmd_to_run, f"hypothesis {hid}")
-            status, conf, auth_state, note = research.classify_validation(kind, svc, code, output)
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            hyp["status"] = status
-            hyp["confidence"] = conf
-            hyp["auth_state"] = auth_state
-            hyp.setdefault("evidence", []).append(f"[validate {ts}] {note} (exit {code})")
-            if output.strip():
-                print("  " + output.strip()[:300].replace("\n", "\n  "))
-            cprint("green", f"  -> {note}")
-            cprint("dim", f"     status={status} confidence={conf} auth_state={auth_state}")
-            if status == research.STATUS_CONFIRMED:
-                finding = f"[{hid}] VALIDATED: {note} ({hyp.get('service','')})"
-                if finding not in session.findings:
-                    session.findings.append(finding)
-                    cprint("green", f"  FINDING: {finding}")
-            continue
-
-        if user_input == ":gtfobins":
-            if research is None:
-                cprint("red", "  Research engine unavailable (research.py not found).")
-                continue
-            sudo_out = ""
-            for r in reversed(session.commands):
-                if "sudo" in r.command and "-l" in r.command and r.output:
-                    sudo_out = r.output
-                    break
-            if not sudo_out:
-                cprint("dim", "  No 'sudo -l' output in history. Run it first, e.g. "
-                              ":rrun sudo -l  (or :run sudo -n -l), then :gtfobins.")
-                continue
-            gtfo = research.load_gtfobins()
-            bins = research.parse_sudo_l(sudo_out)
-            matches = research.gtfobins_lookup(bins, gtfo)
-            if not matches:
-                cprint("dim", f"  No GTFOBins sudo privesc for: {', '.join(bins) or '(none parsed)'}")
-                continue
-            cprint("cyan", f"\n  GTFOBins privesc paths ({len(matches)}):")
-            start = len(session.hypotheses) + 1
-            for i, m in enumerate(matches, start):
-                hid = f"H{i:03d}"
-                cprint("yellow", f"  [{hid}] sudo {m['binary']} — {', '.join(m['functions']) or 'privesc'}")
-                cprint("green", f"       {m['sudo']}")
-                if m["ref"]:
-                    cprint("dim", f"       {m['ref']}")
-                hyp = research.Hypothesis(
-                    id=hid, asset=session.target, service=f"sudo/{m['binary']}",
-                    observation=f"sudo {m['binary']} is a GTFOBins privesc ({', '.join(m['functions'])})",
-                    evidence=[f"sudo -l grants {m['binary']}"], references=[m["ref"]] if m["ref"] else [],
-                    validation_plan=m["sudo"], severity="high", confidence="high",
-                    status=research.STATUS_SUSPECTED, category="privesc",
-                    validation_hint={"binary": m["binary"]},
-                )
-                session.hypotheses.append(hyp.to_dict())
-                finding = f"[{hid}] PRIVESC: sudo {m['binary']} (GTFOBins) on {session.target}"
-                if finding not in session.findings:
-                    session.findings.append(finding)
-            cprint("dim", f"  Recorded {len(matches)} privesc hypothesis/finding(s).")
-            continue
-
-        if user_input == ":hypotheses":
-            if not session.hypotheses:
-                cprint("dim", "  No research hypotheses yet. Use :research <port>.")
-                continue
-            cprint("cyan", f"\n  Research hypotheses ({len(session.hypotheses)}):")
-            for h in session.hypotheses:
-                cprint("yellow", f"  {h.get('id','?')} [{h.get('severity','?')}/"
-                                 f"{h.get('confidence','?')}/{h.get('status','?')}] {h.get('service','')}")
-                if h.get("observation"):
-                    cprint("dim", f"       {h['observation']}")
-            continue
-
-        if user_input == ":chains":
-            if research is None:
-                cprint("red", "  Research engine unavailable (research.py not found).")
-                continue
-            if not session.hypotheses:
-                cprint("dim", "  No hypotheses to link yet. Use :research <port> first.")
-                continue
-            cprint("dim", "  Analyzing attack chains across findings and hypotheses...")
-            start = len(session.attack_chains) + 1
-            try:
-                chains = research.analyze_attack_chains(
-                    session.target, session.hypotheses, session.findings,
-                    client=client, start_idx=start)
-            except Exception as exc:
-                cprint("red", f"  Attack-chain analysis error: {exc}")
-                continue
-            if not chains:
-                cprint("dim", "  No meaningful attack chains linking current observations.")
-                continue
-            for ch in chains:
-                session.attack_chains.append(ch.to_dict())
-                cprint("yellow", f"\n  [{ch.id}] {ch.title}  (confidence: {ch.confidence})")
-                for i, step in enumerate(ch.steps, 1):
-                    cprint("green", f"     {i}. {step}")
-                if ch.assumptions:
-                    cprint("magenta", f"     assumptions: {'; '.join(ch.assumptions)}")
-                if ch.needed_evidence:
-                    cprint("dim", f"     need: {'; '.join(ch.needed_evidence)}")
-                if ch.impact:
-                    cprint("dim", f"     impact: {ch.impact}")
-            cprint("dim", f"\n  {len(chains)} chain(s) recorded (not proof of exploitation).")
-            continue
-
-        if user_input == ":findings":
-            if session.findings:
-                for i, f in enumerate(session.findings, 1):
-                    cprint("green", f"  {i}. {f}")
-            else:
-                cprint("dim", "  No findings yet.")
-            continue
-
-        if user_input == ":history":
-            print(session.all_commands_summary())
-            continue
-
-        if user_input == ":report":
-            path = generate_report(session, report_dir)
-            cprint("green", f"  Report saved: {path}")
-            continue
-
-        if user_input.startswith(":save"):
-            parts = user_input.split(maxsplit=1)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = parts[1] if len(parts) == 2 else f"sessions/session_{session.target.replace('.','_')}_{ts}.json"
-            session.save_to_file(filepath)
-            cprint("green", f"  Session saved: {filepath}")
-            continue
-
-        if user_input.startswith(":load"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                cprint("red", "  Usage: :load <file>")
-                continue
-            try:
-                loaded = Session.load_from_file(parts[1], session.cheatsheet_context)
-                _t, _terr = _sanitize_target(loaded.target)
-                if _terr:
-                    cprint("red", f"  Session file has invalid target: {_terr}")
+                cprint("cyan", f"  Researching {fp.label()} on {session.target} "
+                               f"(online={'yes' if online else 'no'})...")
+                start = len(session.hypotheses) + 1
+                try:
+                    hyps = research_engine.investigate(fp, session.target, client=client,
+                                                       start_idx=start, evidence_text=evidence_text)
+                except Exception as exc:
+                    cprint("red", f"  Research error: {exc}")
                     continue
-                session.target = _t
-                session.phase = loaded.phase
-                session.target_os = loaded.target_os
-                session.credentials = loaded.credentials
-                session.findings = loaded.findings
-                session.commands = loaded.commands
-                cprint("green", f"  Loaded session: {loaded.target}, {len(loaded.commands)} commands, phase={loaded.phase}")
-            except Exception as exc:
-                cprint("red", f"  Load failed: {exc}")
-            continue
-
-        if user_input.startswith(":export"):
-            parts = user_input.split(maxsplit=1)
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = parts[1] if len(parts) == 2 else f"sessions/handoff_{session.target.replace('.','_')}_{ts}.json"
-            try:
-                session.export_bundle(filepath)
-                cprint("green", f"  Handoff bundle exported: {filepath}")
-                cprint("dim", "  Share this file — the other operator runs :import <file> to continue.")
-            except OSError as exc:
-                cprint("red", f"  Export failed: {exc}")
-            continue
-
-        if user_input.startswith(":import"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) != 2:
-                cprint("red", "  Usage: :import <file>  (merge another operator's handoff bundle)")
-                continue
-            try:
-                with open(parts[1].strip(), encoding="utf-8") as f:
-                    data = json.load(f)
-                src = os.path.basename(parts[1].strip())
-                stats = session.merge_from(data, source=src)
-                cprint("green", f"  Imported from {src}:")
-                cprint("green", f"    +{stats['commands']} commands, +{stats['findings']} findings, "
-                                f"+{stats['credentials']} credentials, +{stats.get('hypotheses', 0)} hypotheses")
-                cprint("dim", "  Their history now drives the re-test guard — already-done checks will be skipped.")
-            except Exception as exc:
-                cprint("red", f"  Import failed: {exc}")
-            continue
-
-        if user_input.startswith(":cheat"):
-            parts = user_input.split(maxsplit=1)
-            if len(parts) == 2:
-                extra = load_cheatsheets([parts[1]])
-                if extra:
-                    session.cheatsheet_context += "\n\n---\n\n" + extra
-                    cprint("green", f"  Loaded cheat sheet ({len(extra)} chars)")
-            continue
-
-        # --- agent commands ---
-        if user_input.startswith(":agent"):
-            if agent_mod is None:
-                cprint("red", "  Agent module unavailable (agent.py not found).")
-                continue
-            parts = user_input.split()
-            sub = parts[1] if len(parts) > 1 else "start"
-
-            if sub == "start":
-                if agent_state.running and not agent_state.paused:
-                    cprint("yellow", "  Agent is already running.")
+                if not hyps:
+                    cprint("dim", "  No hypotheses — no leads for this service "
+                                  "(add a knowledge/ module or try --online).")
                     continue
-                agent_state = agent_mod.run_agent_loop(
-                    client, session, execute_cmd, agent_state,
-                    research_fn=lambda: _agent_research(session, research_engine, client, guard),
-                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
-                    scope_checker=lambda cmd: guard.check_command(cmd, session.target),
-                    model_resolver=_model_resolver,
-                )
+                new_findings = 0
+                for h in hyps:
+                    session.hypotheses.append(h.to_dict())
+                    print_hypothesis(h)
+                    # Detection-time finding: a well-supported high/critical hypothesis
+                    # is recorded as a finding now (before any :validate), so :findings
+                    # reflects the risk. :validate later upgrades status to confirmed.
+                    if (h.severity in ("high", "critical")
+                            and h.status in (research.STATUS_SUSPECTED, research.STATUS_CONFIRMED)):
+                        finding = (f"[{h.id}] {h.severity.upper()} / {h.status} — "
+                                   f"{h.observation} ({h.service})")
+                        if finding not in session.findings:
+                            session.findings.append(finding)
+                            new_findings += 1
+                cprint("dim", f"  {len(hyps)} hypotheses recorded — see :hypotheses.")
+                if new_findings:
+                    cprint("green", f"  {new_findings} finding(s) recorded — see :findings "
+                                    f"(validate to confirm).")
+                tech = next((h for h in hyps if h.category == "technique"
+                             and (h.validation_hint or {}).get("validate_commands")), None)
+                if tech:
+                    cprint("cyan", f"  Next: :validate {tech.id} to run safe checks; then "
+                                   f":phase access → :validate {tech.id} for full exploit steps.")
                 continue
 
-            if sub == "resume":
-                if not agent_state.paused:
-                    cprint("dim", "  Agent is not paused.")
+            if user_input.startswith(":validate"):
+                if research is None:
+                    cprint("red", "  Research engine unavailable (research.py not found).")
                     continue
-                agent_state.paused = False
-                agent_state = agent_mod.run_agent_loop(
-                    client, session, execute_cmd, agent_state,
-                    research_fn=lambda: _agent_research(session, research_engine, client, guard),
-                    validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
-                    scope_checker=lambda cmd: guard.check_command(cmd, session.target),
-                    model_resolver=_model_resolver,
-                )
+                tokens = user_input.split()
+                if len(tokens) < 2:
+                    cprint("red", "  Usage: :validate <hypothesis-id>  (e.g. :validate H001)")
+                    continue
+                hid = tokens[1].strip().upper()
+                hyp = next((h for h in session.hypotheses if h.get("id", "").upper() == hid), None)
+                if not hyp:
+                    cprint("red", f"  No hypothesis {hid}. Use :hypotheses to list them.")
+                    continue
+
+                # --- technique hypotheses: multi-step safe validation + phase-gated exploit ---
+                vhint = hyp.get("validation_hint", {}) or {}
+                if hyp.get("category") == "technique" and vhint.get("validate_commands"):
+                    used = cred_used.get(hid, 0)
+                    if used >= cred_attempts:
+                        cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}).")
+                        continue
+                    user = session.credentials.get("username") or vhint.get("default_credential", {}).get("user", "admin")
+                    pw = session.credentials.get("password") or vhint.get("default_credential", {}).get("pass", "changeme")
+                    plan = research.technique_validation_plan(hyp, session.target, user, pw)
+                    cprint("cyan", f"  Validating {hid} — {len(plan)} safe read-only checks "
+                                   f"(attempt {used + 1}/{cred_attempts}):")
+                    results, aborted = [], False
+                    for step in plan:
+                        approval = approve(step["cmd"], warn=step["desc"])
+                        if approval is False:
+                            cprint("dim", "  Skipped this check.")
+                            results.append({**step, "code": 1, "output": ""})
+                            continue
+                        run_cmd = approval if isinstance(approval, str) else step["cmd"]
+                        code, out = guarded_run(run_cmd, timeout=60)
+                        if out.startswith("[BLOCKED]"):
+                            aborted = True
+                            break
+                        guard.audit("validate", session.target, run_cmd, f"technique {hid}")
+                        cprint("dim", f"    {step['desc']}: {out.strip()[:80]}")
+                        results.append({**step, "code": code, "output": out})
+                    if aborted:
+                        continue
+                    cred_used[hid] = used + 1
+                    ok, msg, info = research.eval_technique_validation(results)
+                    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    hyp["status"] = research.STATUS_CONFIRMED if ok else hyp.get("status")
+                    if ok:
+                        hyp["confidence"] = "high"
+                    hyp.setdefault("evidence", []).append(
+                        f"[validate {ts}] {msg} (license={info.get('license','?')})")
+                    cprint("green" if ok else "yellow", f"  -> {msg}  [license={info.get('license','?')}]")
+                    if ok:
+                        finding = f"[{hid}] VALIDATED: {hyp.get('observation','')} ({session.target})"
+                        if finding not in session.findings:
+                            session.findings.append(finding)
+                            cprint("green", f"  FINDING: {finding}")
+                    # exploit steps are access-phase only
+                    if ok and session.phase == "access":
+                        reset_terminal(flush=True)
+                        lhost = input("  LHOST (your listener IP): ").strip() or "{lhost}"
+                        reset_terminal(flush=True)
+                        lport = input("  LPORT [4444]: ").strip() or "4444"
+                        steps = research.technique_exploit_steps(
+                            hyp, session.target, lhost, lport, user, pw)
+                        cprint("magenta", f"\n  Exploit steps for {hid} (operator-executed; authorized scope only):")
+                        for n, s in enumerate(steps, 1):
+                            print(f"  --- step {n} ---")
+                            print("  " + s.replace("\n", "\n  "))
+                        guard.audit("exploit_shown", session.target, hid, "technique exploit steps displayed")
+                    elif ok:
+                        cprint("dim", "  Switch to :phase access and re-run "
+                                      f":validate {hid} to see the full exploit steps.")
+                    continue
+
+                cmd, kind = research.build_validation(hyp, session.target)
+                if cmd is None:
+                    cprint("yellow", f"  {kind}")
+                    continue
+                used = cred_used.get(hid, 0)
+                if used >= cred_attempts:
+                    cprint("red", f"  Attempt limit reached for {hid} ({cred_attempts}). "
+                                  f"Stopping — no brute-force.")
+                    continue
+                svc = (hyp.get("validation_hint", {}) or {}).get("service", "")
+                cprint("cyan", f"  Validation for {hid} ({kind}) — single non-invasive check, "
+                               f"attempt {used + 1}/{cred_attempts}")
+                approval = approve(cmd)  # operator approval + (via guarded_run) scope check
+                if approval is False:
+                    cprint("dim", "  Skipped.")
+                    continue
+                cmd_to_run = approval if isinstance(approval, str) else cmd
+                if cred_delay and used > 0:
+                    time.sleep(cred_delay)
+                code, output = guarded_run(cmd_to_run, timeout=60)
+                if output.startswith("[BLOCKED]"):
+                    continue  # scope guard already reported + audited
+                cred_used[hid] = used + 1
+                guard.audit("validate", session.target, cmd_to_run, f"hypothesis {hid}")
+                status, conf, auth_state, note = research.classify_validation(kind, svc, code, output)
+                ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                hyp["status"] = status
+                hyp["confidence"] = conf
+                hyp["auth_state"] = auth_state
+                hyp.setdefault("evidence", []).append(f"[validate {ts}] {note} (exit {code})")
+                if output.strip():
+                    print("  " + output.strip()[:300].replace("\n", "\n  "))
+                cprint("green", f"  -> {note}")
+                cprint("dim", f"     status={status} confidence={conf} auth_state={auth_state}")
+                if status == research.STATUS_CONFIRMED:
+                    finding = f"[{hid}] VALIDATED: {note} ({hyp.get('service','')})"
+                    if finding not in session.findings:
+                        session.findings.append(finding)
+                        cprint("green", f"  FINDING: {finding}")
                 continue
 
-            if sub == "pause":
-                agent_state.paused = True
-                agent_state.running = False
-                agent_state.pause_reason = "manual"
-                cprint("yellow", "  Agent paused.")
+            if user_input == ":gtfobins":
+                if research is None:
+                    cprint("red", "  Research engine unavailable (research.py not found).")
+                    continue
+                sudo_out = ""
+                for r in reversed(session.commands):
+                    if "sudo" in r.command and "-l" in r.command and r.output:
+                        sudo_out = r.output
+                        break
+                if not sudo_out:
+                    cprint("dim", "  No 'sudo -l' output in history. Run it first, e.g. "
+                                  ":rrun sudo -l  (or :run sudo -n -l), then :gtfobins.")
+                    continue
+                gtfo = research.load_gtfobins()
+                bins = research.parse_sudo_l(sudo_out)
+                matches = research.gtfobins_lookup(bins, gtfo)
+                if not matches:
+                    cprint("dim", f"  No GTFOBins sudo privesc for: {', '.join(bins) or '(none parsed)'}")
+                    continue
+                cprint("cyan", f"\n  GTFOBins privesc paths ({len(matches)}):")
+                start = len(session.hypotheses) + 1
+                for i, m in enumerate(matches, start):
+                    hid = f"H{i:03d}"
+                    cprint("yellow", f"  [{hid}] sudo {m['binary']} — {', '.join(m['functions']) or 'privesc'}")
+                    cprint("green", f"       {m['sudo']}")
+                    if m["ref"]:
+                        cprint("dim", f"       {m['ref']}")
+                    hyp = research.Hypothesis(
+                        id=hid, asset=session.target, service=f"sudo/{m['binary']}",
+                        observation=f"sudo {m['binary']} is a GTFOBins privesc ({', '.join(m['functions'])})",
+                        evidence=[f"sudo -l grants {m['binary']}"], references=[m["ref"]] if m["ref"] else [],
+                        validation_plan=m["sudo"], severity="high", confidence="high",
+                        status=research.STATUS_SUSPECTED, category="privesc",
+                        validation_hint={"binary": m["binary"]},
+                    )
+                    session.hypotheses.append(hyp.to_dict())
+                    finding = f"[{hid}] PRIVESC: sudo {m['binary']} (GTFOBins) on {session.target}"
+                    if finding not in session.findings:
+                        session.findings.append(finding)
+                cprint("dim", f"  Recorded {len(matches)} privesc hypothesis/finding(s).")
                 continue
 
-            if sub == "status":
-                print(agent_mod.format_status(agent_state))
+            if user_input == ":hypotheses":
+                if not session.hypotheses:
+                    cprint("dim", "  No research hypotheses yet. Use :research <port>.")
+                    continue
+                cprint("cyan", f"\n  Research hypotheses ({len(session.hypotheses)}):")
+                for h in session.hypotheses:
+                    cprint("yellow", f"  {h.get('id','?')} [{h.get('severity','?')}/"
+                                     f"{h.get('confidence','?')}/{h.get('status','?')}] {h.get('service','')}")
+                    if h.get("observation"):
+                        cprint("dim", f"       {h['observation']}")
                 continue
 
-            if sub == "log":
-                n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 10
-                print(agent_mod.format_log(agent_state, last_n=n))
+            if user_input == ":chains":
+                if research is None:
+                    cprint("red", "  Research engine unavailable (research.py not found).")
+                    continue
+                if not session.hypotheses:
+                    cprint("dim", "  No hypotheses to link yet. Use :research <port> first.")
+                    continue
+                cprint("dim", "  Analyzing attack chains across findings and hypotheses...")
+                start = len(session.attack_chains) + 1
+                try:
+                    chains = research.analyze_attack_chains(
+                        session.target, session.hypotheses, session.findings,
+                        client=client, start_idx=start)
+                except Exception as exc:
+                    cprint("red", f"  Attack-chain analysis error: {exc}")
+                    continue
+                if not chains:
+                    cprint("dim", "  No meaningful attack chains linking current observations.")
+                    continue
+                for ch in chains:
+                    session.attack_chains.append(ch.to_dict())
+                    cprint("yellow", f"\n  [{ch.id}] {ch.title}  (confidence: {ch.confidence})")
+                    for i, step in enumerate(ch.steps, 1):
+                        cprint("green", f"     {i}. {step}")
+                    if ch.assumptions:
+                        cprint("magenta", f"     assumptions: {'; '.join(ch.assumptions)}")
+                    if ch.needed_evidence:
+                        cprint("dim", f"     need: {'; '.join(ch.needed_evidence)}")
+                    if ch.impact:
+                        cprint("dim", f"     impact: {ch.impact}")
+                cprint("dim", f"\n  {len(chains)} chain(s) recorded (not proof of exploitation).")
                 continue
 
-            if sub == "plan":
-                if not agent_state.plan:
-                    cprint("dim", "  No plan recorded yet.")
+            if user_input == ":findings":
+                if session.findings:
+                    for i, f in enumerate(session.findings, 1):
+                        cprint("green", f"  {i}. {f}")
                 else:
-                    for i, p in enumerate(agent_state.plan, 1):
-                        cprint("cyan", f"  {i}. {p}")
+                    cprint("dim", "  No findings yet.")
                 continue
 
-            if sub == "skip":
-                cprint("dim", "  Skip is handled during the agent approval prompt.")
+            if user_input == ":history":
+                print(session.all_commands_summary())
                 continue
 
-            if sub == "level":
-                if len(parts) < 3 or not parts[2].isdigit():
-                    cprint("dim", f"  Current level: {agent_state.approve_level}")
-                    cprint("dim", "  Usage: :agent level <0-3>")
+            if user_input == ":report":
+                path = generate_report(session, report_dir)
+                cprint("green", f"  Report saved: {path}")
+                continue
+
+            if user_input.startswith(":save"):
+                parts = user_input.split(maxsplit=1)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filepath = parts[1] if len(parts) == 2 else f"sessions/session_{session.target.replace('.','_')}_{ts}.json"
+                session.save_to_file(filepath)
+                cprint("green", f"  Session saved: {filepath}")
+                continue
+
+            if user_input.startswith(":load"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) != 2:
+                    cprint("red", "  Usage: :load <file>")
                     continue
-                lvl = min(3, max(0, int(parts[2])))
-                agent_state.approve_level = lvl
-                cprint("green", f"  Approve level -> {lvl}")
+                try:
+                    loaded = Session.load_from_file(parts[1], session.cheatsheet_context)
+                    _t, _terr = _sanitize_target(loaded.target)
+                    if _terr:
+                        cprint("red", f"  Session file has invalid target: {_terr}")
+                        continue
+                    session.target = _t
+                    session.phase = loaded.phase
+                    session.target_os = loaded.target_os
+                    session.credentials = loaded.credentials
+                    session.findings = loaded.findings
+                    session.commands = loaded.commands
+                    cprint("green", f"  Loaded session: {loaded.target}, {len(loaded.commands)} commands, phase={loaded.phase}")
+                except Exception as exc:
+                    cprint("red", f"  Load failed: {exc}")
                 continue
 
-            cprint("red", f"  Unknown agent subcommand: {sub}")
-            cprint("dim", "  Usage: :agent [start|resume|pause|status|log|plan|level <n>]")
-            continue
-
-        # --- new module commands ---
-
-        if user_input.startswith(":crawl"):
-            if investigation is None or crawler is None:
-                cprint("red", "  Crawler module unavailable.")
+            if user_input.startswith(":export"):
+                parts = user_input.split(maxsplit=1)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filepath = parts[1] if len(parts) == 2 else f"sessions/handoff_{session.target.replace('.','_')}_{ts}.json"
+                try:
+                    session.export_bundle(filepath)
+                    cprint("green", f"  Handoff bundle exported: {filepath}")
+                    cprint("dim", "  Share this file — the other operator runs :import <file> to continue.")
+                except OSError as exc:
+                    cprint("red", f"  Export failed: {exc}")
                 continue
-            parts = user_input.split(maxsplit=1)
-            if len(parts) < 2:
-                cprint("red", "  Usage: :crawl <url>  [--depth N] [--pages N] [--subdomains]")
+
+            if user_input.startswith(":import"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) != 2:
+                    cprint("red", "  Usage: :import <file>  (merge another operator's handoff bundle)")
+                    continue
+                try:
+                    with open(parts[1].strip(), encoding="utf-8") as f:
+                        data = json.load(f)
+                    src = os.path.basename(parts[1].strip())
+                    stats = session.merge_from(data, source=src)
+                    cprint("green", f"  Imported from {src}:")
+                    cprint("green", f"    +{stats['commands']} commands, +{stats['findings']} findings, "
+                                    f"+{stats['credentials']} credentials, +{stats.get('hypotheses', 0)} hypotheses")
+                    cprint("dim", "  Their history now drives the re-test guard — already-done checks will be skipped.")
+                except Exception as exc:
+                    cprint("red", f"  Import failed: {exc}")
                 continue
-            tokens = parts[1].split()
-            url = tokens[0]
-            depth = 10
-            pages = 500
-            subdomains = False
-            i = 1
-            while i < len(tokens):
-                if tokens[i] == "--depth" and i + 1 < len(tokens):
-                    depth = int(tokens[i + 1]); i += 2
-                elif tokens[i] == "--pages" and i + 1 < len(tokens):
-                    pages = int(tokens[i + 1]); i += 2
-                elif tokens[i] == "--subdomains":
-                    subdomains = True; i += 1
+
+            if user_input.startswith(":cheat"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) == 2:
+                    extra = load_cheatsheets([parts[1]])
+                    if extra:
+                        session.cheatsheet_context += "\n\n---\n\n" + extra
+                        cprint("green", f"  Loaded cheat sheet ({len(extra)} chars)")
+                continue
+
+            # --- agent commands ---
+            if user_input.startswith(":agent"):
+                if agent_mod is None:
+                    cprint("red", "  Agent module unavailable (agent.py not found).")
+                    continue
+                parts = user_input.split()
+                sub = parts[1] if len(parts) > 1 else "start"
+
+                if sub == "start":
+                    if agent_state.running and not agent_state.paused:
+                        cprint("yellow", "  Agent is already running.")
+                        continue
+                    agent_state = agent_mod.run_agent_loop(
+                        client, session, execute_cmd, agent_state,
+                        research_fn=lambda: _agent_research(session, research_engine, client, guard),
+                        validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
+                        scope_checker=lambda cmd: guard.check_command(cmd, session.target),
+                        model_resolver=_model_resolver,
+                    )
+                    continue
+
+                if sub == "resume":
+                    if not agent_state.paused:
+                        cprint("dim", "  Agent is not paused.")
+                        continue
+                    agent_state.paused = False
+                    agent_state = agent_mod.run_agent_loop(
+                        client, session, execute_cmd, agent_state,
+                        research_fn=lambda: _agent_research(session, research_engine, client, guard),
+                        validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
+                        scope_checker=lambda cmd: guard.check_command(cmd, session.target),
+                        model_resolver=_model_resolver,
+                    )
+                    continue
+
+                if sub == "pause":
+                    agent_state.paused = True
+                    agent_state.running = False
+                    agent_state.pause_reason = "manual"
+                    cprint("yellow", "  Agent paused.")
+                    continue
+
+                if sub == "status":
+                    print(agent_mod.format_status(agent_state))
+                    continue
+
+                if sub == "log":
+                    n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 10
+                    print(agent_mod.format_log(agent_state, last_n=n))
+                    continue
+
+                if sub == "plan":
+                    if not agent_state.plan:
+                        cprint("dim", "  No plan recorded yet.")
+                    else:
+                        for i, p in enumerate(agent_state.plan, 1):
+                            cprint("cyan", f"  {i}. {p}")
+                    continue
+
+                if sub == "skip":
+                    cprint("dim", "  Skip is handled during the agent approval prompt.")
+                    continue
+
+                if sub == "level":
+                    if len(parts) < 3 or not parts[2].isdigit():
+                        cprint("dim", f"  Current level: {agent_state.approve_level}")
+                        cprint("dim", "  Usage: :agent level <0-3>")
+                        continue
+                    lvl = min(3, max(0, int(parts[2])))
+                    agent_state.approve_level = lvl
+                    cprint("green", f"  Approve level -> {lvl}")
+                    continue
+
+                cprint("red", f"  Unknown agent subcommand: {sub}")
+                cprint("dim", "  Usage: :agent [start|resume|pause|status|log|plan|level <n>]")
+                continue
+
+            # --- new module commands ---
+
+            if user_input.startswith(":crawl"):
+                if investigation is None or crawler is None:
+                    cprint("red", "  Crawler module unavailable.")
+                    continue
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    cprint("red", "  Usage: :crawl <url>  [--depth N] [--pages N] [--subdomains]")
+                    continue
+                tokens = parts[1].split()
+                url = tokens[0]
+                depth = 10
+                pages = 500
+                subdomains = False
+                i = 1
+                while i < len(tokens):
+                    if tokens[i] == "--depth" and i + 1 < len(tokens):
+                        depth = int(tokens[i + 1]); i += 2
+                    elif tokens[i] == "--pages" and i + 1 < len(tokens):
+                        pages = int(tokens[i + 1]); i += 2
+                    elif tokens[i] == "--subdomains":
+                        subdomains = True; i += 1
+                    else:
+                        i += 1
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                def _crawl_progress(crawled, queued, total):
+                    cprint("dim", f"  Crawled {crawled}/{total} pages ({queued} queued)...")
+                cprint("cyan", f"  Crawling {url} (depth={depth}, max={pages})...")
+                stats = investigation.start_crawl(inv, url, max_depth=depth,
+                                                   max_pages=pages,
+                                                   allow_subdomains=subdomains,
+                                                   on_progress=_crawl_progress)
+                if "error" in stats:
+                    cprint("red", f"  Crawl failed: {stats['error']}")
                 else:
-                    i += 1
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            def _crawl_progress(stats):
-                cprint("dim", f"  Crawled {stats.get('total', 0)} pages...")
-            cprint("cyan", f"  Crawling {url} (depth={depth}, max={pages})...")
-            stats = investigation.start_crawl(inv, url, max_depth=depth,
-                                               max_pages=pages,
-                                               allow_subdomains=subdomains,
-                                               on_progress=_crawl_progress)
-            if "error" in stats:
-                cprint("red", f"  Crawl failed: {stats['error']}")
-            else:
-                cprint("green", f"  Crawl complete: {stats}")
-                cprint("dim", investigation.get_crawl_summary(inv))
-            continue
+                    cprint("green", f"  Crawl complete: {stats}")
+                    cprint("dim", investigation.get_crawl_summary(inv))
+                continue
 
-        if user_input.startswith(":explore"):
-            if investigation is None:
-                cprint("red", "  Investigation module unavailable.")
-                continue
-            inv = getattr(interactive_loop, "_inv_ctx", None)
-            if inv is None or inv.website_graph is None:
-                cprint("red", "  No crawl data — run :crawl first.")
-                continue
-            url = investigation.start_explorer_ui(inv)
-            cprint("green", f"  Explorer UI: {url}")
-            continue
-
-        if user_input.startswith(":web-analyze"):
-            if investigation is None:
-                cprint("red", "  Investigation module unavailable.")
-                continue
-            inv = getattr(interactive_loop, "_inv_ctx", None)
-            if inv is None or inv.website_graph is None:
-                cprint("red", "  No crawl data — run :crawl first.")
-                continue
-            analyses = investigation.analyze_crawled_pages(inv)
-            if not analyses:
-                cprint("dim", "  No interesting pages found.")
-            else:
-                cprint("green", f"  Analyzed {len(analyses)} pages:")
-                for a in analyses[:10]:
-                    cats = ", ".join(a.get("categories", []))
-                    cprint("cyan", f"    [{a.get('priority', 0):3d}] {a.get('url', '')} ({cats})")
-            continue
-
-        if user_input.startswith(":atomic"):
-            if atomic_red_team is None:
-                cprint("red", "  Atomic Red Team module unavailable.")
-                continue
-            parts = user_input.split(maxsplit=2)
-            if len(parts) >= 3 and parts[1] == "search":
+            if user_input.startswith(":explore"):
+                if investigation is None:
+                    cprint("red", "  Investigation module unavailable.")
+                    continue
                 inv = getattr(interactive_loop, "_inv_ctx", None)
-                if inv is None or inv.atomic_repo is None:
-                    cprint("red", "  No Atomic repo loaded. Usage: :atomic <path-to-atomics/>")
+                if inv is None or inv.website_graph is None:
+                    cprint("red", "  No crawl data — run :crawl first.")
                     continue
-                results = investigation.search_atomic_tests(inv, parts[2])
-                if not results:
-                    cprint("dim", "  No matching tests.")
+                url = investigation.start_explorer_ui(inv)
+                cprint("green", f"  Explorer UI: {url}")
+                continue
+
+            if user_input.startswith(":web-analyze"):
+                if investigation is None:
+                    cprint("red", "  Investigation module unavailable.")
+                    continue
+                inv = getattr(interactive_loop, "_inv_ctx", None)
+                if inv is None or inv.website_graph is None:
+                    cprint("red", "  No crawl data — run :crawl first.")
+                    continue
+                analyses = investigation.analyze_crawled_pages(inv)
+                if not analyses:
+                    cprint("dim", "  No interesting pages found.")
                 else:
-                    for t in results:
-                        cprint("cyan", f"  [{t['technique_id']}] {t['test_name']} "
-                                       f"({', '.join(t.get('supported_platforms', []))})")
+                    cprint("green", f"  Analyzed {len(analyses)} pages:")
+                    for a in analyses[:10]:
+                        cats = ", ".join(a.get("categories", []))
+                        cprint("cyan", f"    [{a.get('priority', 0):3d}] {a.get('url', '')} ({cats})")
                 continue
-            if len(parts) < 2:
-                cprint("red", "  Usage: :atomic <path-to-atomics/>  or  :atomic search <query>")
-                continue
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            stats = investigation.import_atomic_repo(inv, parts[1])
-            if "error" in stats:
-                cprint("red", f"  Import failed: {stats['error']}")
-            else:
-                cprint("green", f"  Imported: {stats}")
-            continue
 
-        if user_input.startswith(":navigator"):
-            if navigator is None:
-                cprint("red", "  Navigator module unavailable.")
-                continue
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            path = investigation.generate_navigator_layer(inv, session.hypotheses, session.findings)
-            cprint("green", f"  Navigator layer exported: {path}")
-            cprint("dim", "  Open in ATT&CK Navigator: https://mitre-attack.github.io/attack-navigator/")
-            continue
-
-        if user_input.startswith(":caldera-ot"):
-            if caldera_ot is None:
-                cprint("red", "  Caldera OT module unavailable.")
-                continue
-            parts = user_input.split()
-            if len(parts) < 2:
-                cprint("red", "  Usage: :caldera-ot <port1,port2,...>")
-                continue
-            ports = [p.strip() for p in parts[1].split(",")]
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            findings = investigation.check_ot_protocols(inv, ports)
-            if not findings:
-                cprint("dim", "  No OT/ICS protocols detected on those ports.")
-            else:
-                cprint("yellow", f"  OT PROTOCOLS DETECTED ({len(findings)}):")
-                for f in findings:
-                    cprint("yellow", f"    [{f['protocol']}] port {f['port']} — {f['description']}")
-                    for r in f.get("risks", []):
-                        cprint("red", f"      Risk: {r}")
-            continue
-
-        if user_input.startswith(":caldera"):
-            if caldera_adapter is None:
-                cprint("red", "  Caldera adapter module unavailable.")
-                continue
-            parts = user_input.split()
-            url = parts[1] if len(parts) > 1 else ""
-            key = parts[2] if len(parts) > 2 else ""
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            cprint("cyan", "  Connecting to Caldera...")
-            stats = investigation.connect_caldera(inv, url=url, api_key=key)
-            if "error" in stats:
-                cprint("red", f"  {stats['error']}")
-            else:
-                cprint("green", f"  Caldera connected: {stats}")
-            continue
-
-        if user_input.startswith(":advisories"):
-            if vendor_advisories is None:
-                cprint("red", "  Vendor advisories module unavailable.")
-                continue
-            parts = user_input.split(maxsplit=2)
-            if len(parts) < 2:
-                cprint("red", "  Usage: :advisories <product> [vendor]")
-                continue
-            product = parts[1]
-            vendor = parts[2] if len(parts) > 2 else ""
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            cprint("cyan", f"  Searching advisories for {product}...")
-            results = investigation.search_vendor_advisories(inv, product, vendor=vendor)
-            if not results:
-                cprint("dim", "  No advisories found.")
-            else:
-                cprint("green", f"  Found {len(results)} advisories:")
-                for a in results[:10]:
-                    cprint("cyan", f"    [{a['advisory_id']}] {a['vendor']}: {a.get('title', '')}")
-            continue
-
-        if user_input.startswith(":investigate"):
-            if investigation is None:
-                cprint("red", "  Investigation module unavailable.")
-                continue
-            if not hasattr(interactive_loop, "_inv_ctx"):
-                interactive_loop._inv_ctx = investigation.InvestigationContext(
-                    target=session.target, scope_guard=guard,
-                    client=client, online=online, report_dir=report_dir)
-            inv = interactive_loop._inv_ctx
-            report = investigation.export_full_report(inv, session.hypotheses, session.findings)
-            cprint("green", f"  Investigation report exported:")
-            for mod, data in report.get("modules", {}).items():
-                cprint("cyan", f"    {mod}: {data}")
-            continue
-
-        # --- AI interaction ---
-        cprint("dim", "  Thinking...")
-        structured = getattr(client, "structured", False)
-        system, prompt = build_ai_prompt(session, user_input, structured=structured)
-        try:
-            raw = client.run_phase(session.phase, prompt, system, want_json=structured)
-        except ConnectionError as exc:
-            cprint("red", f"  AI error: {exc}")
-            continue
-
-        ai = parse_ai_response(raw)
-
-        if structured:
-            for line in ai.text.splitlines():
-                if line.strip():
-                    print(f"  {line}")
-        else:
-            for line in raw.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("CMD:"):
+            if user_input.startswith(":atomic"):
+                if atomic_red_team is None:
+                    cprint("red", "  Atomic Red Team module unavailable.")
                     continue
-                if stripped:
-                    print(f"  {line}")
-
-        for f in ai.findings:
-            if f not in session.findings:
-                session.findings.append(f)
-                cprint("green", f"  FINDING: {f}")
-
-        if ai.access_line:
-            cprint("yellow", f"\n  ACCESS ONE-LINER: {ai.access_line}")
-            session.findings.append(f"[ACCESS] {ai.access_line}")
-
-        for tool in ai.tool_suggestions:
-            cprint("magenta", f"  TOOL SUGGESTION: {tool}")
-            session.findings.append(f"[TOOL] {tool}")
-
-        for need in ai.needs:
-            cprint("yellow", f"  NEED: {need}")
-
-        if ai.done:
-            cprint("cyan", f"  DONE: {ai.done_summary}")
-            continue
-
-        if ai.command:
-            is_remote = bool(session.ssh)
-            _prior = session.prior_run(ai.command, successful_only=True)
-            approval = approve(ai.command, remote=is_remote,
-                               warn=prior_warning(_prior) if _prior else "")
-            if approval is False:
-                cprint("dim", "  Skipped.")
+                parts = user_input.split(maxsplit=2)
+                if len(parts) >= 3 and parts[1] == "search":
+                    inv = getattr(interactive_loop, "_inv_ctx", None)
+                    if inv is None or inv.atomic_repo is None:
+                        cprint("red", "  No Atomic repo loaded. Usage: :atomic <path-to-atomics/>")
+                        continue
+                    results = investigation.search_atomic_tests(inv, parts[2])
+                    if not results:
+                        cprint("dim", "  No matching tests.")
+                    else:
+                        for t in results:
+                            cprint("cyan", f"  [{t['technique_id']}] {t['test_name']} "
+                                           f"({', '.join(t.get('supported_platforms', []))})")
+                    continue
+                if len(parts) < 2:
+                    cprint("red", "  Usage: :atomic <path-to-atomics/>  or  :atomic search <query>")
+                    continue
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                stats = investigation.import_atomic_repo(inv, parts[1])
+                if "error" in stats:
+                    cprint("red", f"  Import failed: {stats['error']}")
+                else:
+                    cprint("green", f"  Imported: {stats}")
                 continue
 
-            cmd_to_run = approval if isinstance(approval, str) else ai.command
+            if user_input.startswith(":navigator"):
+                if navigator is None:
+                    cprint("red", "  Navigator module unavailable.")
+                    continue
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                path = investigation.generate_navigator_layer(inv, session.hypotheses, session.findings)
+                cprint("green", f"  Navigator layer exported: {path}")
+                cprint("dim", "  Open in ATT&CK Navigator: https://mitre-attack.github.io/attack-navigator/")
+                continue
 
-            cprint("dim", f"  Running{'(remote)' if is_remote else ''}: {cmd_to_run}")
-            code, output = execute_cmd(cmd_to_run)
-            is_useful = code == 0 and len(output.strip()) > 10
-            rec = CommandRecord(
-                phase=session.phase, command=cmd_to_run,
-                exit_code=code, output=output, useful=is_useful,
-                remote=is_remote,
-            )
-            session.commands.append(rec)
+            if user_input.startswith(":caldera-ot"):
+                if caldera_ot is None:
+                    cprint("red", "  Caldera OT module unavailable.")
+                    continue
+                parts = user_input.split()
+                if len(parts) < 2:
+                    cprint("red", "  Usage: :caldera-ot <port1,port2,...>")
+                    continue
+                ports = [p.strip() for p in parts[1].split(",")]
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                findings = investigation.check_ot_protocols(inv, ports)
+                if not findings:
+                    cprint("dim", "  No OT/ICS protocols detected on those ports.")
+                else:
+                    cprint("yellow", f"  OT PROTOCOLS DETECTED ({len(findings)}):")
+                    for f in findings:
+                        cprint("yellow", f"    [{f['protocol']}] port {f['port']} — {f['description']}")
+                        for r in f.get("risks", []):
+                            cprint("red", f"      Risk: {r}")
+                continue
 
-            if output:
-                print(f"\n{output}\n")
+            if user_input.startswith(":caldera"):
+                if caldera_adapter is None:
+                    cprint("red", "  Caldera adapter module unavailable.")
+                    continue
+                parts = user_input.split()
+                url = parts[1] if len(parts) > 1 else ""
+                key = parts[2] if len(parts) > 2 else ""
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                cprint("cyan", "  Connecting to Caldera...")
+                stats = investigation.connect_caldera(inv, url=url, api_key=key)
+                if "error" in stats:
+                    cprint("red", f"  {stats['error']}")
+                else:
+                    cprint("green", f"  Caldera connected: {stats}")
+                continue
 
-            cprint("dim", "  Analyzing results...")
-            analysis_prompt = (
-                f"Command executed: {cmd_to_run}\n"
-                f"Exit code: {code}\n"
-                f"Output:\n{distill_output(cmd_to_run, output)}\n\n"
-                f"Analyze this output. What did we learn? What should we try next?"
-            )
+            if user_input.startswith(":advisories"):
+                if vendor_advisories is None:
+                    cprint("red", "  Vendor advisories module unavailable.")
+                    continue
+                parts = user_input.split(maxsplit=2)
+                if len(parts) < 2:
+                    cprint("red", "  Usage: :advisories <product> [vendor]")
+                    continue
+                product = parts[1]
+                vendor = parts[2] if len(parts) > 2 else ""
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                cprint("cyan", f"  Searching advisories for {product}...")
+                results = investigation.search_vendor_advisories(inv, product, vendor=vendor)
+                if not results:
+                    cprint("dim", "  No advisories found.")
+                else:
+                    cprint("green", f"  Found {len(results)} advisories:")
+                    for a in results[:10]:
+                        cprint("cyan", f"    [{a['advisory_id']}] {a['vendor']}: {a.get('title', '')}")
+                continue
+
+            if user_input.startswith(":investigate"):
+                if investigation is None:
+                    cprint("red", "  Investigation module unavailable.")
+                    continue
+                if not hasattr(interactive_loop, "_inv_ctx"):
+                    interactive_loop._inv_ctx = investigation.InvestigationContext(
+                        target=session.target, scope_guard=guard,
+                        client=client, online=online, report_dir=report_dir)
+                inv = interactive_loop._inv_ctx
+                report = investigation.export_full_report(inv, session.hypotheses, session.findings)
+                cprint("green", f"  Investigation report exported:")
+                for mod, data in report.get("modules", {}).items():
+                    cprint("cyan", f"    {mod}: {data}")
+                continue
+
+            # --- AI interaction ---
+            cprint("dim", "  Thinking...")
+            structured = getattr(client, "structured", False)
+            system, prompt = build_ai_prompt(session, user_input, structured=structured)
             try:
-                analysis = client.analyze(analysis_prompt, system, want_json=structured)
-            except ConnectionError:
-                analysis = ""
+                raw = client.run_phase(session.phase, prompt, system, want_json=structured)
+            except ConnectionError as exc:
+                cprint("red", f"  AI error: {exc}")
+                continue
 
-            analysis_parsed = parse_ai_response(analysis)
-            for f in analysis_parsed.findings:
+            ai = parse_ai_response(raw)
+
+            if structured:
+                for line in ai.text.splitlines():
+                    if line.strip():
+                        print(f"  {line}")
+            else:
+                for line in raw.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("CMD:"):
+                        continue
+                    if stripped:
+                        print(f"  {line}")
+
+            for f in ai.findings:
                 if f not in session.findings:
                     session.findings.append(f)
                     cprint("green", f"  FINDING: {f}")
 
-            if analysis_parsed.access_line:
-                cprint("yellow", f"\n  ACCESS ONE-LINER: {analysis_parsed.access_line}")
+            if ai.access_line:
+                cprint("yellow", f"\n  ACCESS ONE-LINER: {ai.access_line}")
+                session.findings.append(f"[ACCESS] {ai.access_line}")
 
-            if structured:
-                for line in analysis_parsed.text.splitlines():
-                    if line.strip():
-                        print(f"  {line}")
-            else:
-                for line in analysis.splitlines():
-                    stripped = line.strip()
-                    if stripped and not stripped.startswith(("CMD:", "FINDING:", "ACCESS:")):
-                        print(f"  {line}")
+            for tool in ai.tool_suggestions:
+                cprint("magenta", f"  TOOL SUGGESTION: {tool}")
+                session.findings.append(f"[TOOL] {tool}")
 
-            if analysis_parsed.command:
-                rec.note = f"Next suggested: {analysis_parsed.command[:80]}"
+            for need in ai.needs:
+                cprint("yellow", f"  NEED: {need}")
 
+            if ai.done:
+                cprint("cyan", f"  DONE: {ai.done_summary}")
+                continue
+
+            if ai.command:
+                is_remote = bool(session.ssh)
+                _prior = session.prior_run(ai.command, successful_only=True)
+                approval = approve(ai.command, remote=is_remote,
+                                   warn=prior_warning(_prior) if _prior else "")
+                if approval is False:
+                    cprint("dim", "  Skipped.")
+                    continue
+
+                cmd_to_run = approval if isinstance(approval, str) else ai.command
+
+                cprint("dim", f"  Running{'(remote)' if is_remote else ''}: {cmd_to_run}")
+                code, output = execute_cmd(cmd_to_run)
+                is_useful = code == 0 and len(output.strip()) > 10
+                rec = CommandRecord(
+                    phase=session.phase, command=cmd_to_run,
+                    exit_code=code, output=output, useful=is_useful,
+                    remote=is_remote,
+                )
+                session.commands.append(rec)
+
+                if output:
+                    print(f"\n{output}\n")
+
+                cprint("dim", "  Analyzing results...")
+                analysis_prompt = (
+                    f"Command executed: {cmd_to_run}\n"
+                    f"Exit code: {code}\n"
+                    f"Output:\n{distill_output(cmd_to_run, output)}\n\n"
+                    f"Analyze this output. What did we learn? What should we try next?"
+                )
+                try:
+                    analysis = client.analyze(analysis_prompt, system, want_json=structured)
+                except ConnectionError:
+                    analysis = ""
+
+                analysis_parsed = parse_ai_response(analysis)
+                for f in analysis_parsed.findings:
+                    if f not in session.findings:
+                        session.findings.append(f)
+                        cprint("green", f"  FINDING: {f}")
+
+                if analysis_parsed.access_line:
+                    cprint("yellow", f"\n  ACCESS ONE-LINER: {analysis_parsed.access_line}")
+
+                if structured:
+                    for line in analysis_parsed.text.splitlines():
+                        if line.strip():
+                            print(f"  {line}")
+                else:
+                    for line in analysis.splitlines():
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith(("CMD:", "FINDING:", "ACCESS:")):
+                            print(f"  {line}")
+
+                if analysis_parsed.command:
+                    rec.note = f"Next suggested: {analysis_parsed.command[:80]}"
+
+        except KeyboardInterrupt:
+            print()
+            cprint("dim", "  (interrupt — use :quit to exit)")
+            continue
+        except Exception as _exc:
+            import traceback
+            cprint("red", f"  [!] Command failed: {_exc}")
+            if os.environ.get("XSAI_DEBUG"):
+                traceback.print_exc()
+            continue
 
 # ---------------------------------------------------------------------------
 # CLI

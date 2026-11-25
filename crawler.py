@@ -395,9 +395,15 @@ class CrawlState:
         self._cancel_event.set()
         self._pause_event.set()
 
-    def wait_if_paused(self, timeout: float = 1.0) -> bool:
-        """Block while paused. Returns False if cancelled."""
-        self._pause_event.wait(timeout)
+    def wait_if_paused(self, timeout: float | None = None) -> bool:
+        """Block while paused. Returns False if cancelled.
+        `timeout` None = wait indefinitely until resumed/cancelled; a float
+        value polls so callers that want to be responsive can re-check."""
+        while not self._pause_event.is_set() and not self.cancelled:
+            # cancel also sets the pause event, so waking means one of them
+            woke = self._pause_event.wait(timeout if timeout is not None else 0.5)
+            if timeout is not None and not woke:
+                break  # bounded wait expired
         return not self.cancelled
 
 
