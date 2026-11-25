@@ -663,7 +663,8 @@ def generate_project_memory(session: Session) -> str:
     if session.credentials:
         lines.append("## Credentials")
         for k, v in session.credentials.items():
-            lines.append(f"- {k}: {v}")
+            display = v if k != "password" else "***"
+            lines.append(f"- {k}: {display}")
         lines.append("")
 
     # Open ports from scan results
@@ -1067,6 +1068,21 @@ def load_scope(path: str) -> set[str]:
 # configures authorized targets or explicitly opts out with --allow-any-target.
 # Research and planning (no target interaction) are never blocked.
 # ---------------------------------------------------------------------------
+
+_SHELL_META_RE = re.compile(r"[;|&`$()><\n\r\\!{}]")
+
+
+def _sanitize_target(value: str) -> tuple[str, str]:
+    """Validate a target value contains no shell metacharacters.
+    Returns (cleaned_value, error_message).  Empty error means OK."""
+    value = value.strip()
+    if not value:
+        return value, "empty target"
+    m = _SHELL_META_RE.search(value)
+    if m:
+        return "", f"target contains shell metacharacter {m.group()!r} — rejected"
+    return value, ""
+
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _URL_HOST_RE = re.compile(r"(?:https?|ftp)://([^/:@\s\]]+)")
@@ -2813,7 +2829,10 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
         if user_input.startswith(":target"):
             parts = user_input.split(maxsplit=1)
             if len(parts) == 2:
-                new_target = parts[1].strip()
+                new_target, err = _sanitize_target(parts[1])
+                if err:
+                    cprint("red", f"  {err}")
+                    continue
                 session.target = new_target
                 ok, reason = guard.check(new_target)
                 if ok:
@@ -3510,7 +3529,11 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                 continue
             try:
                 loaded = Session.load_from_file(parts[1], session.cheatsheet_context)
-                session.target = loaded.target
+                _t, _terr = _sanitize_target(loaded.target)
+                if _terr:
+                    cprint("red", f"  Session file has invalid target: {_terr}")
+                    continue
+                session.target = _t
                 session.phase = loaded.phase
                 session.target_os = loaded.target_os
                 session.credentials = loaded.credentials
@@ -4210,6 +4233,11 @@ def main() -> int:
 
         if not target:
             print("[FAIL] No target specified.")
+            return 1
+
+        target, san_err = _sanitize_target(target)
+        if san_err:
+            print(f"[FAIL] {san_err}")
             return 1
 
         ok_scope, reason = guard.check(target)
