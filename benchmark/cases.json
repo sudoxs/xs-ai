@@ -342,6 +342,23 @@
       "expect": {"same": true}
     },
     {
+      "id": "version-alpha-suffix-in-range",
+      "category": "cve-relevance",
+      "kind": "applicability",
+      "input": {"service": "openssl", "version": "1.0.1f",
+                "affected": {"version_start": "1.0.1", "version_end_including": "1.0.1f"}},
+      "expect": {"status": "strongly_suspected"}
+    },
+    {
+      "id": "version-alpha-suffix-above-range",
+      "category": "cve-relevance",
+      "kind": "applicability",
+      "negative": true,
+      "input": {"service": "openssl", "version": "1.0.1g",
+                "affected": {"version_start": "1.0.1", "version_end_including": "1.0.1f"}},
+      "expect": {"status": "not_applicable"}
+    },
+    {
       "id": "registry-fallback-aware",
       "category": "model-registry",
       "kind": "registry_fallback",

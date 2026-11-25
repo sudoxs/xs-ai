@@ -1094,6 +1094,21 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _URL_HOST_RE = re.compile(r"(?:https?|ftp)://([^/:@\s\]]+)")
 _IPV6_RE = re.compile(r"(?:::ffff:)?(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}"
                        r"|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}")
+# A bare hostname with at least one dot and a TLD of >=2 letters.
+# Conservative on purpose: filenames like "report.md" with a 2-char ext
+# can match, but those get rejected downstream as not-in-scope rather than
+# letting an off-target host sneak through.
+_BARE_HOST_RE = re.compile(
+    r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b"
+)
+# File-extension / path artefacts that _BARE_HOST_RE would match but aren't
+# hosts. Extendable, not exhaustive — anything missed just needs to be in
+# scope.allowed if the operator is targeting it.
+_FILE_EXT_SUFFIXES = (
+    ".md", ".txt", ".json", ".yml", ".yaml", ".log", ".conf", ".ini",
+    ".sh", ".py", ".rb", ".pl", ".js", ".ts", ".csv", ".xml", ".pdf",
+    ".tar", ".gz", ".zip", ".bak",
+)
 
 
 @dataclass
@@ -1142,7 +1157,13 @@ class ScopeGuard:
         return False, f"{target} is not in the authorized scope"
 
     def _extract_hosts(self, command: str) -> set[str]:
-        """Extract all host references from a command: IPv4, IPv6, URL hostnames."""
+        """Extract host references from a command: IPv4, IPv6, URL hostnames,
+        and bare DNS names (e.g. `nmap scanme.example.com`).
+
+        Bare hostnames are only extracted from tokens that aren't flags and
+        don't look like file paths. A false positive just forces the operator
+        to add that string to scope; a false negative lets a command touch an
+        unauthorized host, so we lean toward over-extracting."""
         hosts: set[str] = set()
         hosts.update(_IPV4_RE.findall(command))
         hosts.update(_URL_HOST_RE.findall(command))
@@ -1152,22 +1173,76 @@ class ScopeGuard:
                 hosts.add(mapped[7:])
             else:
                 hosts.add(mapped)
+
+        # Bare hostnames from non-flag tokens
+        try:
+            toks = shlex.split(command, posix=True)
+        except ValueError:
+            toks = command.split()
+        for raw in toks:
+            t = raw.strip("'\"`,;|()<>[]{} ")
+            if not t:
+                continue
+            # flag=value — keep only the value
+            if t.startswith("-") and "=" in t:
+                t = t.split("=", 1)[1].strip("'\"`")
+            elif t.startswith("-"):
+                continue
+            # file paths (leading / or . or contain / or \)
+            if t.startswith(("/", ".", "~", "\\")) or "/" in t or "\\" in t:
+                continue
+            tl = t.lower()
+            if tl.endswith(_FILE_EXT_SUFFIXES):
+                continue
+            # already captured as IPv4/IPv6
+            if _IPV4_RE.fullmatch(tl) or _IPV6_RE.fullmatch(tl):
+                continue
+            if _BARE_HOST_RE.fullmatch(tl):
+                hosts.add(tl)
+
         hosts.discard("127.0.0.1")
         hosts.discard("0.0.0.0")
         hosts.discard("localhost")
         return hosts
 
+    def _host_or_resolved_matches(self, host: str) -> bool:
+        """Accept a host if its literal form is in scope OR it resolves to
+        an IP that is in scope. Resolution is bounded by a short timeout;
+        on failure we return False (fail-closed).
+
+        Note: resolving hostnames in the hot path adds DNS latency to every
+        command — acceptable here because the alternative is letting a bare
+        hostname bypass a CIDR-only scope entirely."""
+        if self._host_matches(host):
+            return True
+        # Literal IP that didn't match — no point trying DNS.
+        try:
+            ipaddress.ip_address(host)
+            return False
+        except ValueError:
+            pass
+        import socket as _socket
+        _socket.setdefaulttimeout(3)
+        try:
+            ip = _socket.gethostbyname(host)
+        except OSError:
+            return False
+        finally:
+            _socket.setdefaulttimeout(None)
+        return self._host_matches(ip)
+
     def check_command(self, command: str, session_target: str) -> tuple[bool, str]:
-        """Authorize an execution: the session target AND every host reference in
-        the command must be in scope (stops an AI/typed command from reaching an
-        out-of-scope host)."""
+        """Authorize an execution: the session target AND every host reference
+        in the command must be in scope (stops an AI/typed command from
+        reaching an out-of-scope host). Bare hostnames are resolved to IP so
+        a scope defined by CIDR still catches `nmap target.example.com`."""
         ok, reason = self.check(session_target)
         if not ok:
             return ok, reason
         if self.allow_any:
             return True, reason
         for host in self._extract_hosts(command):
-            if not self._host_matches(host):
+            if not self._host_or_resolved_matches(host):
                 return False, f"command references out-of-scope host {host}"
         return True, "in scope"
 
@@ -1177,7 +1252,9 @@ class ScopeGuard:
         if self.allow_any:
             return True, "scope enforcement disabled"
         for host in self._extract_hosts(command):
-            if not self.configured or not self._host_matches(host):
+            if not self.configured:
+                return False, f"command references out-of-scope host {host}"
+            if not self._host_or_resolved_matches(host):
                 return False, f"command references out-of-scope host {host}"
         return True, "ok"
 

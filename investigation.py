@@ -184,6 +184,9 @@ def analyze_crawled_pages(ctx: InvestigationContext) -> list[dict]:
             "redirect_chain": node.redirect_chain,
             "incoming_links": node.incoming_links,
             "outgoing_links": node.outgoing_links,
+            # Hand the HTML sample to analyze_page so AUTH/FILE/SEARCH signals
+            # (which need to look at the body) can fire.
+            "body_sample": getattr(node, "body_sample", "") or "",
         }
 
     analyses = web_analysis.analyze_graph({"nodes": nodes_dict})

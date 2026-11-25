@@ -214,8 +214,39 @@ def fingerprint_for_port(port: str, nmap_output: str = "",
 # ---------------------------------------------------------------------------
 
 def _ver_tuple(v: str) -> tuple:
-    parts = re.findall(r"\d+", v or "")
-    return tuple(int(p) for p in parts) if parts else ()
+    """Version comparator that preserves alpha suffixes.
+    `1.0.1f` -> `((1,''), (0,''), (1,'f'))`, so `1.0.1f` < `1.0.1g` and
+    `1.0.1` < `1.0.1a` (an unsuffixed release precedes its lettered patches —
+    matches the OpenSSL / Apache convention). Uses packaging.version if
+    available for closer-to-PEP-440 behaviour, otherwise a stdlib comparator."""
+    if not v:
+        return ()
+    v = v.strip()
+    # split on dots and commas; also tolerate '-' as a separator
+    segs = re.split(r"[.\-_,]", v)
+    out = []
+    for seg in segs:
+        m = re.match(r"^(\d+)([A-Za-z]*)$", seg)
+        if m:
+            out.append((int(m.group(1)), m.group(2).lower()))
+        else:
+            # pure alpha segment (rc1, beta, etc.) — rank it below a numeric
+            # segment by using -1 as the numeric part
+            out.append((-1, seg.lower()))
+    return tuple(out)
+
+
+def _ver_cmp(a: tuple, b: tuple) -> int:
+    """Three-way compare two _ver_tuple results with length-safe padding."""
+    n = max(len(a), len(b))
+    pad = (0, "")
+    aa = a + (pad,) * (n - len(a))
+    bb = b + (pad,) * (n - len(b))
+    if aa < bb:
+        return -1
+    if aa > bb:
+        return 1
+    return 0
 
 
 def version_in_range(version: str, start: str = "", end_excl: str = "",
@@ -224,11 +255,11 @@ def version_in_range(version: str, start: str = "", end_excl: str = "",
     v = _ver_tuple(version)
     if not v:
         return False
-    if start and v < _ver_tuple(start):
+    if start and _ver_cmp(v, _ver_tuple(start)) < 0:
         return False
-    if end_excl and not (v < _ver_tuple(end_excl)):
+    if end_excl and _ver_cmp(v, _ver_tuple(end_excl)) >= 0:
         return False
-    if end_incl and not (v <= _ver_tuple(end_incl)):
+    if end_incl and _ver_cmp(v, _ver_tuple(end_incl)) > 0:
         return False
     return True
 

@@ -208,12 +208,15 @@ def analyze_page(node_dict: dict, body_text: str = "") -> PageAnalysis:
 
 
 def analyze_graph(graph_dict: dict) -> list[PageAnalysis]:
-    """Analyze all pages in a graph, return prioritized list."""
+    """Analyze all pages in a graph, return prioritized list.
+    If a node carries a 'body_sample' field (provided by the crawler), that
+    body is passed to analyze_page so AUTH/FILE/SEARCH signals can fire."""
     results = []
     for pid, node in graph_dict.get("nodes", {}).items():
         if node.get("crawl_status") != "crawled":
             continue
-        pa = analyze_page(node)
+        body = node.get("body_sample", "") or ""
+        pa = analyze_page(node, body_text=body)
         if pa.categories:
             results.append(pa)
     results.sort(key=lambda p: -p.priority)

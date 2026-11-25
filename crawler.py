@@ -53,7 +53,7 @@ BLOCKED_HOSTS = {
     "169.254.169.254", "metadata.google.internal",
     "100.100.100.200",
 }
-BLOCKED_CIDRS = ["169.254.0.0/16", "10.255.255.0/24"]
+BODY_SAMPLE_MAX = 64 * 1024  # 64 KiB of HTML kept on the node for later analysis
 
 _SCHEME_RE = re.compile(r"^https?://", re.I)
 
@@ -114,7 +114,14 @@ def same_domain(url: str, origin: str, allow_subdomains: bool = False) -> bool:
     return a_host.endswith("." + b_host) or a_host == b_host
 
 
-def _is_blocked_host(host: str) -> bool:
+def _is_blocked_host(host: str, scope_guard: Any = None) -> bool:
+    """Reject metadata/loopback/link-local always; reject private/reserved
+    unless the operator explicitly authorized this host in scope_guard.
+
+    An engagement can legitimately target RFC1918 ranges, so private/reserved
+    is gated on operator intent — but loopback, link-local, metadata and
+    multicast are never accepted even when the operator says so, since they
+    are the SSRF-pivot targets we exist to stop."""
     h = host.lower().strip()
     if h in BLOCKED_HOSTS:
         return True
@@ -123,14 +130,50 @@ def _is_blocked_host(host: str) -> bool:
     try:
         import ipaddress
         ip = ipaddress.ip_address(h)
-        if ip.is_loopback or ip.is_link_local:
+        # unwrap IPv4-mapped IPv6 (::ffff:a.b.c.d)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        # Hard block — never crawlable
+        if (ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_unspecified):
             return True
-        for cidr in BLOCKED_CIDRS:
-            if ip in ipaddress.ip_network(cidr, strict=False):
-                return True
+        in_scope = False
+        if scope_guard is not None:
+            try:
+                ok, _ = scope_guard.check(str(ip))
+                in_scope = ok
+            except Exception:
+                in_scope = False
+        # Soft block — allowed only when operator opted in via scope
+        if (ip.is_private or ip.is_reserved) and not in_scope:
+            return True
     except ValueError:
         pass
     return False
+
+
+def _resolve_and_pin(hostname: str, port: int,
+                     scope_guard: Any = None) -> tuple[bool, str, str]:
+    """Resolve once, validate every result, return the first allowed IP.
+    The caller connects to that IP (not to `hostname` again) to close the
+    DNS-rebinding TOCTOU gap where a malicious resolver could flip answers
+    between validate and connect."""
+    try:
+        infos = socket.getaddrinfo(hostname, port,
+                                   socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        return False, f"DNS resolution failed: {e}", ""
+    first_blocked = ""
+    for _fam, _type, _proto, _canon, sa in infos:
+        ip_str = sa[0]
+        if _is_blocked_host(ip_str, scope_guard):
+            first_blocked = first_blocked or ip_str
+            continue
+        return True, "ok", ip_str
+    if first_blocked:
+        return False, (f"DNS rebinding guard: {hostname} resolves to "
+                        f"blocked {first_blocked}"), first_blocked
+    return False, f"no usable address for {hostname}", ""
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +250,13 @@ class PageNode:
     crawl_status: str = "pending"  # pending / crawled / error / skipped / redirect
     error: str = ""
     headers: dict = field(default_factory=dict)
+    # Up to BODY_SAMPLE_MAX chars of the HTML body — kept so later analysis
+    # (web_analysis.analyze_page) can look for AUTH/FILE/SEARCH signals that
+    # live in the response body, not just metadata.
+    body_sample: str = ""
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, include_body: bool = True) -> dict:
+        d = {
             "page_id": self.page_id,
             "original_url": self.original_url,
             "normalized_url": self.normalized_url,
@@ -228,6 +275,10 @@ class PageNode:
             "crawl_status": self.crawl_status,
             "error": self.error,
         }
+        if include_body and self.body_sample:
+            # Already truncated at capture time; stored as-is.
+            d["body_sample"] = self.body_sample
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +374,7 @@ class WebsiteGraph:
                 content_fingerprint=nd.get("content_fingerprint", ""),
                 discovery_timestamp=nd.get("discovery_timestamp", ""),
                 crawl_status=nd.get("crawl_status", "pending"), error=nd.get("error", ""),
+                body_sample=nd.get("body_sample", "")[:BODY_SAMPLE_MAX],
             )
             g.nodes[pid] = node
             g.url_to_id[node.normalized_url] = pid
@@ -412,30 +464,31 @@ class CrawlState:
 # ---------------------------------------------------------------------------
 
 def validate_crawl_target(url: str, scope_guard: Any = None) -> tuple[bool, str]:
-    """Check that a URL is safe to crawl (not SSRF, in scope, valid scheme)."""
+    """Check that a URL is safe to crawl (not SSRF, in scope, valid scheme).
+
+    Note: this is a pre-flight check; the actual fetch re-resolves and pins
+    the IP it will connect to via _resolve_and_pin, closing the DNS-rebinding
+    TOCTOU gap that would otherwise exist between here and _fetch_page."""
     p = urllib.parse.urlparse(url)
     if p.scheme not in ("http", "https"):
         return False, f"unsupported scheme: {p.scheme}"
     host = (p.hostname or "").lower()
     if not host:
         return False, "empty hostname"
-    if _is_blocked_host(host):
-        return False, f"blocked host: {host} (localhost/metadata/link-local)"
-    # DNS resolution check: resolve and verify IP isn't blocked
-    try:
-        infos = socket.getaddrinfo(host, p.port or (443 if p.scheme == "https" else 80),
-                                   socket.AF_UNSPEC, socket.SOCK_STREAM)
-        for _fam, _type, _proto, _canon, sa in infos:
-            ip_str = sa[0]
-            if _is_blocked_host(ip_str):
-                return False, f"DNS rebinding: {host} resolves to blocked {ip_str}"
-    except socket.gaierror:
-        pass  # will fail on connect anyway
+    if _is_blocked_host(host, scope_guard):
+        return False, f"blocked host: {host} (loopback/metadata/private)"
+    port = p.port or (443 if p.scheme == "https" else 80)
+    ok, reason, _ip = _resolve_and_pin(host, port, scope_guard)
+    if not ok:
+        # If DNS failed entirely, let the fetch stage try — the pinned fetch
+        # will fail-closed with the same check. Only reject here if the host
+        # actually resolves to a blocked address.
+        if "blocked" in reason or "rebinding" in reason:
+            return False, reason
     # scope guard check
     if scope_guard:
         ok, reason = scope_guard.check(host)
         if not ok:
-            # also check by IP
             try:
                 ip = socket.gethostbyname(host)
                 ok, reason = scope_guard.check(ip)
@@ -461,32 +514,84 @@ def validate_redirect(redirect_url: str, origin: str,
 
 def _fetch_page(url: str, config: CrawlConfig) -> tuple[int, str, dict, list[str], str]:
     """Fetch a URL, return (status, body, headers, redirect_chain, final_url).
-    Follows redirects manually to track the chain."""
+
+    Pins the connection to a validated IP (no second DNS lookup between
+    validate and connect), keeps TLS SNI/verification on the original
+    hostname, and re-validates every redirect destination the same way.
+    Follows redirects manually so the chain is observable."""
+    import http.client
+
     redirect_chain: list[str] = []
     current = url
     max_redirects = 10
-    ctx = ssl.create_default_context()
 
     for _ in range(max_redirects):
-        req = urllib.request.Request(current, method="GET", headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.1",
-        })
+        p = urllib.parse.urlparse(current)
+        hostname = (p.hostname or "").lower()
+        if not hostname or p.scheme not in ("http", "https"):
+            return 0, "", {}, redirect_chain, current
+        port = p.port or (443 if p.scheme == "https" else 80)
+        path = p.path or "/"
+        if p.query:
+            path = f"{path}?{p.query}"
+
+        # Resolve once, pin that IP. Rebinding guard runs inside.
+        ok, reason, pinned_ip = _resolve_and_pin(hostname, port, config.scope_guard)
+        if not ok:
+            return 0, "", {}, redirect_chain, current
+
+        conn: http.client.HTTPConnection | None = None
+        sock = None
         try:
-            # Use a custom opener that doesn't follow redirects
-            class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
-            opener = urllib.request.build_opener(_NoRedirect)
-            resp = opener.open(req, timeout=config.timeout)
-            status = resp.getcode()
-            headers = dict(resp.headers)
-            ct = headers.get("Content-Type", "")
-            # check content type
+            # Connect by IP, not by hostname — the IP cannot change under us.
+            sock = socket.create_connection((pinned_ip, port), timeout=config.timeout)
+            if p.scheme == "https":
+                ssl_ctx = ssl.create_default_context()
+                # SNI + cert check against the real hostname, over the pinned socket
+                sock = ssl_ctx.wrap_socket(sock, server_hostname=hostname)
+                conn = http.client.HTTPSConnection(hostname, port, timeout=config.timeout)
+            else:
+                conn = http.client.HTTPConnection(hostname, port, timeout=config.timeout)
+            # Pre-set the socket so conn.request() does not reconnect by name.
+            conn.sock = sock
+            conn.request("GET", path, headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.1",
+                "Host": hostname if port in (80, 443) else f"{hostname}:{port}",
+            })
+            resp = conn.getresponse()
+            status = resp.status
+            headers = {k: v for k, v in resp.getheaders()}
+
+            if status in (301, 302, 303, 307, 308):
+                location = headers.get("Location") or headers.get("location") or ""
+                try:
+                    resp.read()  # drain
+                except Exception:
+                    pass
+                if not location:
+                    return status, "", headers, redirect_chain, current
+                redirect_chain.append(current)
+                new_url = normalize_url(location, current)
+                if not new_url:
+                    return status, "", headers, redirect_chain, current
+                # Same-origin check up front, then the loop re-resolves and
+                # re-pins the destination (so a redirect cannot escape into
+                # metadata/private space either).
+                if not same_domain(new_url, config.start_url, config.allow_subdomains):
+                    return status, "", headers, redirect_chain, current
+                current = new_url
+                continue
+
+            ct = headers.get("Content-Type") or headers.get("content-type") or ""
             mime = ct.split(";")[0].strip().lower()
             if mime not in CONTENT_TYPES:
+                try:
+                    resp.read(1)
+                except Exception:
+                    pass
                 return status, "", headers, redirect_chain, current
-            # read with size limit
+
             body_bytes = resp.read(config.max_response_size + 1)
             if len(body_bytes) > config.max_response_size:
                 return status, "", headers, redirect_chain, current
@@ -498,26 +603,15 @@ def _fetch_page(url: str, config: CrawlConfig) -> tuple[int, str, dict, list[str
             except (LookupError, UnicodeDecodeError):
                 body = body_bytes.decode("utf-8", errors="replace")
             return status, body, headers, redirect_chain, current
-        except urllib.error.HTTPError as e:
-            status = e.code
-            if status in (301, 302, 303, 307, 308):
-                location = e.headers.get("Location", "")
-                if not location:
-                    return status, "", dict(e.headers), redirect_chain, current
-                redirect_chain.append(current)
-                new_url = normalize_url(location, current)
-                if not new_url:
-                    return status, "", dict(e.headers), redirect_chain, current
-                # validate redirect
-                ok, reason = validate_redirect(new_url, config.start_url,
-                                               config.allow_subdomains, config.scope_guard)
-                if not ok:
-                    return status, "", dict(e.headers), redirect_chain, current
-                current = new_url
-                continue
-            return status, "", dict(e.headers) if hasattr(e, "headers") else {}, redirect_chain, current
-        except (urllib.error.URLError, socket.timeout, OSError, ssl.SSLError) as e:
+        except (socket.timeout, OSError, ssl.SSLError,
+                http.client.HTTPException):
             return 0, "", {}, redirect_chain, current
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
 
     return 0, "", {}, redirect_chain, current
 
@@ -629,6 +723,9 @@ def crawl(config: CrawlConfig) -> tuple[WebsiteGraph, CrawlState]:
         links, title, canonical = extract_links(body, final_url)
         node.title = title
         node.canonical_url = canonical
+        # Keep a bounded sample of the HTML body for later analysis
+        # (web_analysis AUTH/FILE/SEARCH signals need the actual body).
+        node.body_sample = body[:BODY_SAMPLE_MAX]
         node.crawl_status = "crawled"
         state.pages_crawled += 1
 
