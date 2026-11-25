@@ -501,6 +501,10 @@ def run_agent_loop(
                 _cprint("yellow", "  [Agent] Paused (Ctrl+C)")
                 break
 
+            # track session state before this step for stall detection
+            _hyp_count_before = len(session.hypotheses) if hasattr(session, "hypotheses") else 0
+            _find_count_before = len(session.findings) if hasattr(session, "findings") else 0
+
             # re-plan periodically
             if state.step > 0 and state.step % PLAN_INTERVAL == 0:
                 _cprint("dim", "  [Agent] Re-planning...")
@@ -561,15 +565,30 @@ def run_agent_loop(
                     break
 
             if action.action_type == "command" and action.approved:
-                try:
-                    exit_code, output = execute_fn(action.command)
-                    action.executed = True
-                    action.exit_code = exit_code
-                    action.output = output
-                    state.executed_commands.add(_normalize_command(action.command))
-                except Exception as exc:
-                    action.error = str(exc)
-                    _cprint("red", f"  [Agent] Command error: {exc}")
+                cmd = action.command.strip()
+                _PHASE_NAMES = {"recon", "enum", "access", "privesc", "discovery"}
+                if cmd.lower() in _PHASE_NAMES:
+                    _cprint("yellow", f"  [Agent] '{cmd}' is a phase, not a command — converting to set_phase")
+                    action.action_type = "set_phase"
+                    if cmd.lower() in ("recon", "enum", "access", "privesc"):
+                        session.phase = cmd.lower()
+                        action.executed = True
+                        _cprint("green", f"  [Agent] Phase -> {cmd.lower()}")
+                    else:
+                        action.error = f"invalid phase: {cmd}"
+                elif not cmd or cmd.startswith(":"):
+                    action.error = f"not a shell command: {cmd}"
+                    _cprint("yellow", f"  [Agent] Skipping non-shell command: {cmd}")
+                else:
+                    try:
+                        exit_code, output = execute_fn(cmd)
+                        action.executed = True
+                        action.exit_code = exit_code
+                        action.output = output
+                        state.executed_commands.add(_normalize_command(cmd))
+                    except Exception as exc:
+                        action.error = str(exc)
+                        _cprint("red", f"  [Agent] Command error: {exc}")
 
             elif action.action_type == "set_phase" and action.approved:
                 new_phase = action.command
@@ -614,11 +633,16 @@ def run_agent_loop(
             _save_log(state)
 
             # stall detection: pause if N consecutive steps yield no new
-            # findings, no new executed commands, and no phase changes
+            # findings, no new hypotheses, no executed commands, and no phase changes
+            _hyp_count_after = len(session.hypotheses) if hasattr(session, "hypotheses") else 0
+            _find_count_after = len(session.findings) if hasattr(session, "findings") else 0
+            new_intel = (_hyp_count_after > _hyp_count_before
+                         or _find_count_after > _find_count_before)
             made_progress = (
-                action.action_type == "command" and action.executed and action.output
-            ) or (
-                action.action_type == "set_phase" and action.executed
+                (action.action_type == "command" and action.executed)
+                or (action.action_type == "set_phase" and action.executed)
+                or (action.action_type == "research" and action.executed and new_intel)
+                or (action.action_type == "validate" and action.executed)
             )
             if made_progress:
                 state._last_progress_step = state.step
@@ -637,6 +661,11 @@ def run_agent_loop(
         _save_log(state)
     finally:
         signal.signal(signal.SIGINT, old_handler)
+
+    if state.step >= max_steps and state.running:
+        state.running = False
+        state.pause_reason = "max-steps-reached"
+        _cprint("yellow", f"  [Agent] Stopped — reached max steps ({max_steps})")
 
     _save_log(state)
     _cprint("dim", f"  [Agent] {state.step} steps, elapsed {state.elapsed()}")
