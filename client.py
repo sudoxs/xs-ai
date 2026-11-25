@@ -1090,6 +1090,33 @@ def _sanitize_target(value: str) -> tuple[str, str]:
     return value, ""
 
 
+def _resolve_hostname(host: str, timeout: float = 3.0) -> str | None:
+    """DNS lookup with a per-call timeout and no global state. Returns the
+    resolved IP as string, or None on timeout/failure. Isolated in a worker
+    thread because socket.gethostbyname has no timeout parameter and
+    socket.setdefaulttimeout would race with other threads."""
+    import socket as _socket
+    import threading
+    import queue
+    q: "queue.Queue[str | None]" = queue.Queue(maxsize=1)
+
+    def _work() -> None:
+        try:
+            q.put(_socket.gethostbyname(host))
+        except OSError:
+            q.put(None)
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None  # leaked thread finishes on its own; result discarded
+    try:
+        return q.get_nowait()
+    except queue.Empty:
+        return None
+
+
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _URL_HOST_RE = re.compile(r"(?:https?|ftp)://([^/:@\s\]]+)")
 _IPV6_RE = re.compile(r"(?:::ffff:)?(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}"
@@ -1207,12 +1234,10 @@ class ScopeGuard:
 
     def _host_or_resolved_matches(self, host: str) -> bool:
         """Accept a host if its literal form is in scope OR it resolves to
-        an IP that is in scope. Resolution is bounded by a short timeout;
-        on failure we return False (fail-closed).
-
-        Note: resolving hostnames in the hot path adds DNS latency to every
-        command — acceptable here because the alternative is letting a bare
-        hostname bypass a CIDR-only scope entirely."""
+        an IP that is in scope. Resolution is bounded by a per-call timeout
+        via a worker thread — we must not touch socket.setdefaulttimeout,
+        which would race with parallel auto-enum workers.
+        On resolution failure we return False (fail-closed)."""
         if self._host_matches(host):
             return True
         # Literal IP that didn't match — no point trying DNS.
@@ -1221,14 +1246,9 @@ class ScopeGuard:
             return False
         except ValueError:
             pass
-        import socket as _socket
-        _socket.setdefaulttimeout(3)
-        try:
-            ip = _socket.gethostbyname(host)
-        except OSError:
+        ip = _resolve_hostname(host, timeout=3.0)
+        if ip is None:
             return False
-        finally:
-            _socket.setdefaulttimeout(None)
         return self._host_matches(ip)
 
     def check_command(self, command: str, session_target: str) -> tuple[bool, str]:

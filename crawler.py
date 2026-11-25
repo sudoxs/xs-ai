@@ -575,11 +575,26 @@ def _fetch_page(url: str, config: CrawlConfig) -> tuple[int, str, dict, list[str
                 new_url = normalize_url(location, current)
                 if not new_url:
                     return status, "", headers, redirect_chain, current
-                # Same-origin check up front, then the loop re-resolves and
-                # re-pins the destination (so a redirect cannot escape into
-                # metadata/private space either).
+                # Full validation of the redirect target: same-origin, scope
+                # (not just SSRF ranges — the explicit scope allow-list), and
+                # resolve-and-pin of the new host happens on the next loop.
                 if not same_domain(new_url, config.start_url, config.allow_subdomains):
                     return status, "", headers, redirect_chain, current
+                if config.scope_guard is not None:
+                    new_host = (urllib.parse.urlparse(new_url).hostname or "").lower()
+                    if new_host:
+                        sg_ok, _sg_reason = config.scope_guard.check(new_host)
+                        if not sg_ok:
+                            # try by resolved IP before giving up, so a
+                            # CIDR-only scope still accepts hostname redirects
+                            new_port = (urllib.parse.urlparse(new_url).port
+                                        or (443 if urllib.parse.urlparse(new_url).scheme == "https" else 80))
+                            r_ok, _r_reason, r_ip = _resolve_and_pin(
+                                new_host, new_port, config.scope_guard)
+                            if r_ok and r_ip:
+                                sg_ok, _ = config.scope_guard.check(r_ip)
+                        if not sg_ok:
+                            return status, "", headers, redirect_chain, current
                 current = new_url
                 continue
 
