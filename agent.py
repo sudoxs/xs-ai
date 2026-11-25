@@ -110,6 +110,8 @@ class AgentState:
     executed_commands: set[str] = field(default_factory=set)
     _last_progress_step: int = 0
     _consec_errors: int = 0
+    _consec_noprogress: int = 0
+    _auto_research_tried: bool = False
 
     def elapsed(self) -> str:
         if not self.start_time:
@@ -535,6 +537,57 @@ def _ask_approval(action: Action) -> str:
         _cprint("dim", "  Enter a/s/p/q")
 
 
+def _bump_noprogress(state: AgentState) -> bool:
+    """Increment the no-progress counter; return True if the caller must
+    break out of the loop because the threshold was crossed."""
+    state._consec_noprogress += 1
+    if state._consec_noprogress >= STALL_THRESHOLD:
+        state.paused = True
+        state.pause_reason = "no-progress-loop"
+        _cprint("yellow",
+                 f"  [Agent] agent is repeating already-run commands — "
+                 f"pausing for operator (no progress for "
+                 f"{STALL_THRESHOLD} steps)")
+        return True
+    return False
+
+
+def _try_auto_research(session: Any, state: AgentState,
+                       research_fn: Callable | None) -> bool:
+    """One-shot rescue: when the loop is stuck and recon has actually
+    produced output, run the research pipeline once so hypotheses can be
+    built from what's already on disk.
+
+    Returns True if research produced new intel (new hypotheses/findings)."""
+    if research_fn is None or state._auto_research_tried:
+        return False
+    phase = getattr(session, "phase", "")
+    if phase not in ("recon", "enum"):
+        return False
+    cmds = getattr(session, "commands", [])
+    has_nmap = any("nmap" in getattr(c, "command", "") and getattr(c, "output", "")
+                    for c in cmds)
+    if not has_nmap:
+        return False
+    if getattr(session, "hypotheses", None):
+        return False  # already have intel, no rescue needed
+
+    hyp_before = len(session.hypotheses) if hasattr(session, "hypotheses") else 0
+    find_before = len(session.findings) if hasattr(session, "findings") else 0
+    state._auto_research_tried = True
+    _cprint("cyan",
+             "  [Agent] stuck re-scanning — running research on existing "
+             "nmap output")
+    try:
+        research_fn()
+    except Exception as exc:
+        _cprint("yellow", f"  [Agent] auto-research failed: {exc}")
+        return False
+    hyp_after = len(session.hypotheses) if hasattr(session, "hypotheses") else 0
+    find_after = len(session.findings) if hasattr(session, "findings") else 0
+    return hyp_after > hyp_before or find_after > find_before
+
+
 def run_agent_loop(
     client: Any,
     session: Any,
@@ -641,6 +694,16 @@ def run_agent_loop(
                     action.error = "duplicate command"
                     state.actions.append(action)
                     _save_log(state)
+                    # Last-ditch: if the model is stuck re-proposing scans
+                    # and there's actual nmap output waiting to be analysed,
+                    # kick research once before letting the no-progress
+                    # counter climb. This is passive (no new commands) and
+                    # scope-safe — research_fn uses the existing pipeline.
+                    if _try_auto_research(session, state, research_fn):
+                        state._consec_noprogress = 0
+                        continue
+                    if _bump_noprogress(state):
+                        break
                     continue
 
             if auto_approve(action, state.approve_level):
@@ -656,6 +719,8 @@ def run_agent_loop(
                     action.skipped = True
                     state.actions.append(action)
                     _save_log(state)
+                    if _bump_noprogress(state):
+                        break
                     continue
                 elif choice == "pause":
                     action.skipped = True
@@ -780,7 +845,14 @@ def run_agent_loop(
             )
             if made_progress:
                 state._last_progress_step = state.step
-            elif state.step - state._last_progress_step >= STALL_THRESHOLD:
+                state._consec_noprogress = 0
+            else:
+                # Any action reaching this point that was neither skipped nor
+                # progress still counts against the no-progress budget so a
+                # loop of unexecuted/errored actions also pauses cleanly.
+                if _bump_noprogress(state):
+                    break
+            if state.step - state._last_progress_step >= STALL_THRESHOLD and not state.paused:
                 _cprint("yellow",
                          f"  [Agent] Stall detected — {STALL_THRESHOLD} steps "
                          "with no new output. Pausing for operator review.")
