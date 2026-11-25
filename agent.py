@@ -34,6 +34,8 @@ MAX_AI_CONTEXT = 28_000
 PLAN_INTERVAL = 8
 PLAN_SIZE = 5
 STALL_THRESHOLD = 5
+MAX_CONSEC_ERRORS = 5
+ERROR_BACKOFF_SECS = 3
 
 SAFE_PREFIXES = (
     "nmap", "curl -s", "curl -k -s", "wget -q", "cat ", "head ", "tail ",
@@ -107,6 +109,7 @@ class AgentState:
     pause_reason: str = ""
     executed_commands: set[str] = field(default_factory=set)
     _last_progress_step: int = 0
+    _consec_errors: int = 0
 
     def elapsed(self) -> str:
         if not self.start_time:
@@ -547,10 +550,25 @@ def run_agent_loop(
                 break
 
             if action.action_type == "retry":
-                _cprint("yellow", f"  [Agent] {action.description} — retrying next step")
+                state._consec_errors += 1
+                _cprint("yellow",
+                        f"  [Agent] {action.description} "
+                        f"(consecutive errors: {state._consec_errors}/{MAX_CONSEC_ERRORS})")
                 state.actions.append(action)
                 _save_log(state)
+                if state._consec_errors >= MAX_CONSEC_ERRORS:
+                    state.paused = True
+                    state.pause_reason = "too-many-model-errors"
+                    _cprint("red",
+                            f"  [Agent] Paused — {MAX_CONSEC_ERRORS} consecutive "
+                            "model errors. Check the backend and :agent resume.")
+                    break
+                # small backoff so we don't hammer a flaky backend
+                import time as _time
+                _time.sleep(ERROR_BACKOFF_SECS)
                 continue
+            # any non-retry action resets the counter
+            state._consec_errors = 0
 
             # command deduplication check
             if action.action_type == "command" and action.command:

@@ -146,24 +146,10 @@ def start_explorer_ui(ctx: InvestigationContext, port: int = 8477) -> str:
     if ctx.website_graph is None:
         return "No crawl data — run :crawl first."
 
-    graph_data = {
-        "nodes": [],
-        "stats": ctx.website_graph.stats(),
-    }
-    for pid, node in ctx.website_graph.nodes.items():
-        nd = {
-            "id": pid,
-            "url": node.normalized_url or node.original_url,
-            "title": node.title or "",
-            "status": node.http_status,
-            "depth": node.crawl_depth,
-            "content_type": node.content_type or "",
-            "size": node.response_size,
-            "outgoing": list(node.outgoing_links),
-            "incoming": list(node.incoming_links),
-        }
-        graph_data["nodes"].append(nd)
-
+    # Hand the UI exactly the schema its JS expects: nodes dict keyed by
+    # page_id, with the PageNode field names (normalized_url, http_status,
+    # crawl_depth, response_size, outgoing_links, incoming_links, …).
+    graph_data = ctx.website_graph.to_dict()
     server, url = explorer.start_explorer(graph_data, port=port)
     ctx.explorer_server = server
     return url
