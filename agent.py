@@ -255,6 +255,72 @@ _PLACEHOLDER_PLAN_EXACT = {
 }
 
 
+_THINK_TAG_RE = re.compile(
+    r"<(?:think|thinking|reasoning|reason)\b[^>]*>.*?</\s*(?:think|thinking|reasoning|reason)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Pull the agent's response object out of a model reply.
+
+    Handles: <think>...</think> / <reasoning>...</reasoning> blocks that
+    thinking models (qwen3.5, deepseek-r1, …) emit, ```json fences,
+    free-text before and after, and nested braces inside string values.
+    Scans every '{' as a candidate start; returns the first balanced
+    object that parses."""
+    if not text:
+        return None
+    s = _THINK_TAG_RE.sub("", text).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+    # also strip a trailing fence anywhere — some models wrap only the end
+    s = re.sub(r"\n```\s*$", "", s).strip()
+
+    n = len(s)
+    best: dict | None = None
+    i = 0
+    while i < n:
+        if s[i] != "{":
+            i += 1
+            continue
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(i, n):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end == -1:
+            break
+        try:
+            obj = json.loads(s[i:end], strict=False)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            # Prefer an object that carries one of our action/plan keys
+            if any(k in obj for k in ("action_type", "plan", "command",
+                                       "phase", "hypothesis_id", "done_reason")):
+                return obj
+            if best is None:
+                best = obj
+        i = end
+    return best
+
+
 def _is_placeholder_plan_step(s: str) -> bool:
     s = (s or "").strip()
     if not s:
@@ -366,7 +432,9 @@ def _generate_plan(
 
     try:
         raw = client.run_phase("recon", prompt, system=system, want_json=True)
-        data = json.loads(raw)
+        # Robust extractor: strips <think> blocks, ```json fences, and
+        # finds the first balanced-brace object anywhere in the reply.
+        data = _extract_json_object(raw) or {}
         plan = data.get("plan", [])
         if isinstance(plan, list) and plan:
             # Drop placeholder lines like "step 1 description" that weak
@@ -406,25 +474,17 @@ def decide_next_action(
             timestamp=_now(),
         )
 
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group())
-            except json.JSONDecodeError:
-                return Action(
-                    step=state.step, phase=session.phase, action_type="done",
-                    description="Model returned unparseable response",
-                    error=raw[:300], timestamp=_now(),
-                )
-        else:
-            return Action(
-                step=state.step, phase=session.phase, action_type="done",
-                description="Model returned unparseable response",
-                error=raw[:300], timestamp=_now(),
-            )
+    data = _extract_json_object(raw)
+    if data is None:
+        # Unparseable reply must NOT silently end the engagement. Return a
+        # retry action; the loop's _consec_errors / _consec_noprogress will
+        # eventually pause if the model keeps spitting garbage.
+        state.step += 1
+        return Action(
+            step=state.step, phase=session.phase, action_type="retry",
+            description="unparseable model response",
+            error=raw[:300], timestamp=_now(),
+        )
 
     state.step += 1
     return Action(
