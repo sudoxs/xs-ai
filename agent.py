@@ -171,9 +171,15 @@ Respond with a JSON object:
 Rules:
 - ONE action per response, no lists.
 - For "command": give the exact, ready-to-run shell command.
+- For the very first recon command, pick a FAST scan first:
+  `nmap -Pn -sV --top-ports 100 -T3 <target>`. Do NOT start with `-p-`
+  (full port sweep is far too slow for a first step). Do NOT use `-sS`
+  unless running as root — prefer `-sT`. Run a deep/full scan only after
+  the quick scan has findings.
 - For "research": triggers the :research pipeline on the current target/ports.
 - For "validate": triggers :validate on a specific hypothesis.
 - For "set_phase": move to the next pentest phase when current is exhausted.
+  Do NOT set_phase to the phase you are already in — that is a no-op.
 - For "done": the engagement is complete or no more actions are productive.
 - Prefer safe, read-only commands first. Only suggest writes/exploits in
   access/privesc phases.
@@ -184,27 +190,76 @@ Rules:
 - Follow the current plan steps in order when available.
 """)
 
+
+def _sanitize_command(cmd: str) -> tuple[str, str]:
+    """Apply safety rewrites before executing a command.
+    Returns (rewritten, note). An empty note means no change."""
+    original = cmd
+    note = ""
+    # nmap -sS needs raw sockets i.e. root. Non-root quietly returns no results
+    # and wastes a slot. Downgrade to -sT (TCP connect scan).
+    if " nmap " in f" {cmd} " or cmd.startswith("nmap "):
+        import shlex as _shlex
+        try:
+            toks = _shlex.split(cmd)
+        except ValueError:
+            toks = cmd.split()
+        if "-sS" in toks:
+            is_root = False
+            if hasattr(os, "geteuid"):
+                try:
+                    is_root = (os.geteuid() == 0)
+                except Exception:
+                    is_root = False
+            if not is_root:
+                toks = ["-sT" if t == "-sS" else t for t in toks]
+                cmd = " ".join(toks)
+                note = "rewrote -sS -> -sT (not running as root; SYN scan needs raw sockets)"
+    return cmd, note
+
 PLAN_SYSTEM = textwrap.dedent("""\
 You are a pentest planner. Given the current state of the engagement, produce
 a focused plan of exactly {n} concrete next steps.
 
-Respond with a JSON object:
-{{
-  "plan": [
-    "step 1 description",
-    "step 2 description",
-    ...
-  ],
-  "reasoning": "brief explanation of why these steps"
-}}
+Respond with a JSON object whose "plan" is a list of {n} strings; each string
+MUST be a concrete action on the actual target, never a placeholder like
+"step N description".
 
 Rules:
 - Each step must be a concrete, actionable task (not vague like "investigate").
+- For the very first recon step, use a FAST scan: service/version against
+  top-ports (e.g. `nmap -Pn -sV --top-ports 100 -T3 <target>`). Do NOT
+  start with `-p-` (full 65k port sweep) and do NOT use `-sS` unless the
+  session is root — prefer `-sT` (TCP connect scan) otherwise. A full scan
+  belongs AFTER the quick scan finds something.
 - Steps should build on each other logically.
 - Consider what commands have already been run — do not re-plan completed work.
 - Focus on the current phase's goals.
 - If findings suggest a pivot, plan the pivot path.
 """)
+
+
+# Placeholder lines that weak models parrot straight from the schema example;
+# these must be dropped from any plan the model returns.
+_PLACEHOLDER_PLAN_RE = re.compile(
+    r"^\s*step\s*\d+\s*(?:description|here|text|action)?\s*\.?\s*$",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_PLAN_EXACT = {
+    "step 1 description", "step 2 description", "step 3 description",
+    "step 4 description", "step 5 description",
+    "concrete action on the actual target",
+    "<a concrete, executable step>",
+}
+
+
+def _is_placeholder_plan_step(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return True
+    if s.lower() in _PLACEHOLDER_PLAN_EXACT:
+        return True
+    return bool(_PLACEHOLDER_PLAN_RE.match(s))
 
 
 def _build_context(session: Any, state: AgentState) -> str:
@@ -312,7 +367,13 @@ def _generate_plan(
         data = json.loads(raw)
         plan = data.get("plan", [])
         if isinstance(plan, list) and plan:
-            return [str(s) for s in plan[:PLAN_SIZE]]
+            # Drop placeholder lines like "step 1 description" that weak
+            # models echo straight from the schema example — a plan full of
+            # those is worse than no plan.
+            filtered = [str(s).strip() for s in plan[:PLAN_SIZE]
+                        if not _is_placeholder_plan_step(str(s))]
+            if filtered:
+                return filtered
     except Exception:
         pass
     return []
@@ -484,6 +545,7 @@ def run_agent_loop(
     validate_fn=None,
     scope_checker=None,
     model_resolver: Callable | None = None,
+    record_fn: Callable | None = None,
 ) -> AgentState:
     _interrupted = [False]
 
@@ -609,25 +671,48 @@ def run_agent_loop(
                     _cprint("yellow", "  [Agent] Stopped")
                     break
 
+            _phase_was_noop = False
             if action.action_type == "command" and action.approved:
                 cmd = action.command.strip()
                 _VALID_PHASES = {"recon", "enum", "access", "privesc"}
                 if cmd.lower() in _VALID_PHASES:
-                    _cprint("yellow", f"  [Agent] '{cmd}' is a phase, not a command — converting to set_phase")
-                    action.action_type = "set_phase"
-                    session.phase = cmd.lower()
-                    action.executed = True
-                    _cprint("green", f"  [Agent] Phase -> {cmd.lower()}")
+                    target_phase = cmd.lower()
+                    if target_phase == session.phase:
+                        _cprint("dim", f"  [Agent] already in phase {target_phase} — no-op")
+                        action.action_type = "set_phase"
+                        action.skipped = True
+                        action.error = f"already in phase {target_phase}"
+                        _phase_was_noop = True
+                    else:
+                        _cprint("yellow", f"  [Agent] '{cmd}' is a phase, not a command — converting to set_phase")
+                        action.action_type = "set_phase"
+                        session.phase = target_phase
+                        action.executed = True
+                        _cprint("green", f"  [Agent] Phase -> {target_phase}")
                 elif not cmd or cmd.startswith(":"):
                     action.error = f"not a shell command: {cmd}"
                     _cprint("yellow", f"  [Agent] Skipping non-shell command: {cmd}")
                 else:
+                    # pre-execute safety rewrites (e.g. -sS -> -sT off root)
+                    cmd, san_note = _sanitize_command(cmd)
+                    if san_note:
+                        _cprint("yellow", f"  [Agent] {san_note}")
+                        _cprint("dim", f"    -> {cmd}")
+                        action.command = cmd
                     try:
                         exit_code, output = execute_fn(cmd)
                         action.executed = True
                         action.exit_code = exit_code
                         action.output = output
                         state.executed_commands.add(_normalize_command(cmd))
+                        # Mirror the outcome into session.commands so
+                        # downstream consumers (_agent_research scraping
+                        # nmap output, reports, prior-run dedup) can see it.
+                        if record_fn is not None:
+                            try:
+                                record_fn(cmd, session.phase, exit_code, output)
+                            except Exception as _rec_exc:
+                                _cprint("yellow", f"  [Agent] record_fn failed: {_rec_exc}")
                     except Exception as exc:
                         action.error = str(exc)
                         _cprint("red", f"  [Agent] Command error: {exc}")
@@ -635,9 +720,15 @@ def run_agent_loop(
             elif action.action_type == "set_phase" and action.approved:
                 new_phase = action.command
                 if new_phase in ("recon", "enum", "access", "privesc"):
-                    session.phase = new_phase
-                    action.executed = True
-                    _cprint("green", f"  [Agent] Phase -> {new_phase}")
+                    if new_phase == session.phase:
+                        _cprint("dim", f"  [Agent] already in phase {new_phase} — no-op")
+                        action.skipped = True
+                        action.error = f"already in phase {new_phase}"
+                        _phase_was_noop = True
+                    else:
+                        session.phase = new_phase
+                        action.executed = True
+                        _cprint("green", f"  [Agent] Phase -> {new_phase}")
                 else:
                     action.error = f"invalid phase: {new_phase}"
 
@@ -682,7 +773,8 @@ def run_agent_loop(
                          or _find_count_after > _find_count_before)
             made_progress = (
                 (action.action_type == "command" and action.executed)
-                or (action.action_type == "set_phase" and action.executed)
+                or (action.action_type == "set_phase" and action.executed
+                    and not _phase_was_noop)
                 or (action.action_type == "research" and action.executed and new_intel)
                 or (action.action_type == "validate" and action.executed)
             )

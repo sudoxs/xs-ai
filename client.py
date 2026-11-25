@@ -2881,6 +2881,19 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
     if hasattr(client, "registry") and client.registry:
         _model_resolver = client.registry.resolve_role
 
+    def _agent_record(cmd: str, phase: str, exit_code: int, output: str) -> None:
+        """Mirror an agent-executed command into session.commands so that
+        _agent_research, prior_run dedup and the final report all see it."""
+        session.commands.append(CommandRecord(
+            phase=phase,
+            command=cmd,
+            exit_code=exit_code,
+            output=output,
+            useful=(exit_code == 0 and len(output.strip()) > 10),
+            note="agent",
+            remote=bool(session.ssh),
+        ))
+
     if agent_start and agent_mod and agent_state is not None:
         cprint("cyan", "  [Agent] Auto-starting agent mode (--agent flag)")
         agent_state = agent_mod.run_agent_loop(
@@ -2889,6 +2902,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
             validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
             scope_checker=lambda cmd: guard.check_command(cmd, session.target),
             model_resolver=_model_resolver,
+            record_fn=_agent_record,
         )
 
     while True:
@@ -3726,6 +3740,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                         validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
                         scope_checker=lambda cmd: guard.check_command(cmd, session.target),
                         model_resolver=_model_resolver,
+                        record_fn=_agent_record,
                     )
                     continue
 
@@ -3740,6 +3755,7 @@ def interactive_loop(client: OllamaClient | AIBackend, session: Session, scope: 
                         validate_fn=lambda hid: _agent_validate(session, research_engine, client, guard, hid, execute_fn=execute_cmd),
                         scope_checker=lambda cmd: guard.check_command(cmd, session.target),
                         model_resolver=_model_resolver,
+                        record_fn=_agent_record,
                     )
                     continue
 
